@@ -1,8 +1,10 @@
 use crate::rng::Rng;
 use std::{
-    collections::VecDeque,
-    fs::File,
+    collections::{HashSet, VecDeque},
+    fs::{self, File},
     io::{BufRead, BufReader, BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Clone, Debug)]
@@ -13,6 +15,7 @@ pub struct GoBoard {
     pub ko: Option<usize>,
     pub passes: u8,
     pub moves: usize,
+    position_history: Arc<HashSet<u64>>,
 }
 
 impl GoBoard {
@@ -20,35 +23,68 @@ impl GoBoard {
         if !(5..=19).contains(&size) {
             return Err("Go size must be 5..19".into());
         }
-        Ok(Self {
+        let mut board = Self {
             size,
             cells: vec![0; size * size],
             turn: 1,
             ko: None,
             passes: 0,
             moves: 0,
-        })
+            position_history: Arc::new(HashSet::new()),
+        };
+        let initial_hash = board.position_hash();
+        Arc::make_mut(&mut board.position_history).insert(initial_hash);
+        Ok(board)
+    }
+    pub fn with_setup(
+        size: usize,
+        black: &[usize],
+        white: &[usize],
+        turn: i8,
+    ) -> Result<Self, String> {
+        if !matches!(turn, -1 | 1) {
+            return Err("Go turn must be -1 or 1".into());
+        }
+        let mut board = Self::new(size)?;
+        for (color, points) in [(1, black), (-1, white)] {
+            for &point in points {
+                if point >= board.cells.len() || board.cells[point] != 0 {
+                    return Err("invalid or overlapping Go setup stones".into());
+                }
+                board.cells[point] = color;
+            }
+        }
+        board.turn = turn;
+        let initial_hash = board.position_hash();
+        Arc::make_mut(&mut board.position_history).clear();
+        Arc::make_mut(&mut board.position_history).insert(initial_hash);
+        Ok(board)
     }
     pub fn pass_action(&self) -> usize {
         self.cells.len()
     }
-    fn neighbors(&self, p: usize) -> Vec<usize> {
+    fn neighbors(&self, p: usize) -> ([usize; 4], usize) {
         let r = p / self.size;
         let c = p % self.size;
-        let mut n = Vec::with_capacity(4);
+        let mut neighbors = [0; 4];
+        let mut count = 0;
         if r > 0 {
-            n.push(p - self.size)
+            neighbors[count] = p - self.size;
+            count += 1;
         }
         if r + 1 < self.size {
-            n.push(p + self.size)
+            neighbors[count] = p + self.size;
+            count += 1;
         }
         if c > 0 {
-            n.push(p - 1)
+            neighbors[count] = p - 1;
+            count += 1;
         }
         if c + 1 < self.size {
-            n.push(p + 1)
+            neighbors[count] = p + 1;
+            count += 1;
         }
-        n
+        (neighbors, count)
     }
     fn group(&self, start: usize) -> (Vec<usize>, usize) {
         let color = self.cells[start];
@@ -60,7 +96,8 @@ impl GoBoard {
         q.push_back(start);
         while let Some(p) = q.pop_front() {
             stones.push(p);
-            for n in self.neighbors(p) {
+            let (neighbors, count) = self.neighbors(p);
+            for &n in &neighbors[..count] {
                 if self.cells[n] == 0 {
                     liberties[n] = true
                 } else if self.cells[n] == color && !seen[n] {
@@ -71,7 +108,117 @@ impl GoBoard {
         }
         (stones, liberties.into_iter().filter(|x| *x).count())
     }
+    fn group_liberties(&self) -> (Vec<usize>, Vec<usize>, Vec<u64>) {
+        let mut group_at = vec![usize::MAX; self.cells.len()];
+        let mut liberty_seen = vec![usize::MAX; self.cells.len()];
+        let mut liberties = Vec::new();
+        let mut group_hashes = Vec::new();
+        let mut queue = VecDeque::new();
+
+        for start in 0..self.cells.len() {
+            if self.cells[start] == 0 || group_at[start] != usize::MAX {
+                continue;
+            }
+            let group = liberties.len();
+            let marker = group;
+            let color = self.cells[start];
+            let mut count = 0;
+            let mut group_hash = 0;
+            group_at[start] = group;
+            queue.push_back(start);
+            while let Some(p) = queue.pop_front() {
+                group_hash ^= Self::stone_hash(p, color);
+                let (neighbors, neighbor_count) = self.neighbors(p);
+                for &neighbor in &neighbors[..neighbor_count] {
+                    if self.cells[neighbor] == 0 {
+                        if liberty_seen[neighbor] != marker {
+                            liberty_seen[neighbor] = marker;
+                            count += 1;
+                        }
+                    } else if self.cells[neighbor] == color && group_at[neighbor] == usize::MAX {
+                        group_at[neighbor] = group;
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+            liberties.push(count);
+            group_hashes.push(group_hash);
+        }
+        (group_at, liberties, group_hashes)
+    }
+    fn has_liberty_after_play(
+        &self,
+        action: usize,
+        group_at: &[usize],
+        liberties: &[usize],
+    ) -> bool {
+        let (neighbors, count) = self.neighbors(action);
+        for &neighbor in &neighbors[..count] {
+            match self.cells[neighbor] {
+                0 => return true,
+                color if color == self.turn => {
+                    if liberties[group_at[neighbor]] > 1 {
+                        return true;
+                    }
+                }
+                _ => {
+                    if liberties[group_at[neighbor]] == 1 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    fn stone_hash(point: usize, color: i8) -> u64 {
+        let mut value = (point as u64)
+            .wrapping_mul(2)
+            .wrapping_add(u64::from(color == -1))
+            .wrapping_add(0x9e3779b97f4a7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+        value ^ (value >> 31)
+    }
+    fn position_hash(&self) -> u64 {
+        self.cells
+            .iter()
+            .enumerate()
+            .filter(|(_, color)| **color != 0)
+            .fold(0, |hash, (point, &color)| {
+                hash ^ Self::stone_hash(point, color)
+            })
+    }
+    fn position_hash_after_play(
+        &self,
+        action: usize,
+        group_at: &[usize],
+        liberties: &[usize],
+        group_hashes: &[u64],
+        current_hash: u64,
+    ) -> u64 {
+        let (neighbors, count) = self.neighbors(action);
+        let mut hash = current_hash ^ Self::stone_hash(action, self.turn);
+        let mut captured_groups = Vec::new();
+        for &neighbor in &neighbors[..count] {
+            if self.cells[neighbor] == -self.turn {
+                let group = group_at[neighbor];
+                if liberties[group] == 1 && !captured_groups.contains(&group) {
+                    captured_groups.push(group);
+                }
+            }
+        }
+        for group in captured_groups {
+            hash ^= group_hashes[group];
+        }
+        hash
+    }
     pub fn play(&mut self, action: usize) -> Result<(), String> {
+        self.play_inner(action, true)
+    }
+    pub(crate) fn play_for_analysis(&mut self, action: usize) -> Result<(), String> {
+        self.play_inner(action, false)
+    }
+    fn play_inner(&mut self, action: usize, enforce_superko: bool) -> Result<(), String> {
         if action == self.pass_action() {
             self.turn = -self.turn;
             self.ko = None;
@@ -85,23 +232,58 @@ impl GoBoard {
         if self.ko == Some(action) {
             return Err("illegal ko recapture".into());
         }
-        let before = self.clone();
+        let (neighbors, count) = self.neighbors(action);
+        let next_hash = if enforce_superko {
+            let (group_at, liberties, group_hashes) = self.group_liberties();
+            if !self.has_liberty_after_play(action, &group_at, &liberties) {
+                return Err("illegal suicide".into());
+            }
+            Some(self.position_hash_after_play(
+                action,
+                &group_at,
+                &liberties,
+                &group_hashes,
+                self.position_hash(),
+            ))
+        } else {
+            let mut has_liberty = false;
+            for &neighbor in &neighbors[..count] {
+                if self.cells[neighbor] == 0 {
+                    has_liberty = true;
+                    break;
+                }
+                let (_, liberties) = self.group(neighbor);
+                if (self.cells[neighbor] == self.turn && liberties > 1)
+                    || (self.cells[neighbor] == -self.turn && liberties == 1)
+                {
+                    has_liberty = true;
+                    break;
+                }
+            }
+            if !has_liberty {
+                return Err("illegal suicide".into());
+            }
+            None
+        };
         self.cells[action] = self.turn;
         let mut captured = Vec::new();
-        for n in self.neighbors(action) {
+        for &n in &neighbors[..count] {
             if self.cells[n] == -self.turn {
-                let (g, l) = self.group(n);
-                if l == 0 {
-                    for p in g {
-                        self.cells[p] = 0;
-                        captured.push(p);
+                let (stones, remaining_liberties) = self.group(n);
+                if remaining_liberties == 0 {
+                    for point in stones {
+                        self.cells[point] = 0;
+                        captured.push(point);
                     }
                 }
             }
         }
-        if self.group(action).1 == 0 {
-            *self = before;
-            return Err("illegal suicide".into());
+        if next_hash.is_some_and(|hash| self.position_history.contains(&hash)) {
+            self.cells[action] = 0;
+            for point in captured {
+                self.cells[point] = -self.turn;
+            }
+            return Err("illegal positional superko".into());
         }
         let own_group = self.group(action).0;
         self.ko = if captured.len() == 1 && own_group.len() == 1 {
@@ -112,16 +294,30 @@ impl GoBoard {
         self.turn = -self.turn;
         self.passes = 0;
         self.moves += 1;
+        if let Some(hash) = next_hash {
+            Arc::make_mut(&mut self.position_history).insert(hash);
+        }
         Ok(())
     }
     pub fn legal_moves(&self) -> Vec<usize> {
         let mut out = Vec::new();
+        let (group_at, liberties, group_hashes) = self.group_liberties();
+        let current_hash = self.position_hash();
         for p in 0..self.cells.len() {
-            if self.cells[p] == 0 && self.ko != Some(p) {
-                let mut b = self.clone();
-                if b.play(p).is_ok() {
-                    out.push(p)
-                }
+            if self.cells[p] == 0
+                && self.ko != Some(p)
+                && self.has_liberty_after_play(p, &group_at, &liberties)
+                && !self
+                    .position_history
+                    .contains(&self.position_hash_after_play(
+                        p,
+                        &group_at,
+                        &liberties,
+                        &group_hashes,
+                        current_hash,
+                    ))
+            {
+                out.push(p);
             }
         }
         out.push(self.pass_action());
@@ -145,7 +341,8 @@ impl GoBoard {
                     q.push_back(p);
                     while let Some(x) = q.pop_front() {
                         area.push(x);
-                        for n in self.neighbors(x) {
+                        let (neighbors, count) = self.neighbors(x);
+                        for &n in &neighbors[..count] {
                             match self.cells[n] {
                                 1 => black = true,
                                 -1 => white = true,
@@ -188,6 +385,11 @@ pub struct GoGame {
     pub size: usize,
     pub moves: Vec<usize>,
     pub winner: i8,
+    pub result: Option<String>,
+    pub komi: Option<String>,
+    pub first_turn: i8,
+    pub black_setup: Vec<usize>,
+    pub white_setup: Vec<usize>,
 }
 pub fn generate(path: &str, size: usize, games: usize, seed: u64) -> Result<(), String> {
     let mut rng = Rng::new(seed);
@@ -205,13 +407,27 @@ pub fn generate(path: &str, size: usize, games: usize, seed: u64) -> Result<(), 
             b.play(action)?;
             seq.push(action);
         }
-        let winner = if b.score_black(6.5) > 0.0 { 1 } else { -1 };
+        let score = b.score_black(6.5);
+        let winner = if score > 0.0 {
+            1
+        } else if score < 0.0 {
+            -1
+        } else {
+            0
+        };
+        let result = if score == 0.0 {
+            "0".to_owned()
+        } else if score > 0.0 {
+            format!("B+{score:.1}")
+        } else {
+            format!("W+{:.1}", score.abs())
+        };
         let moves = seq
             .iter()
             .map(|x| x.to_string())
             .collect::<Vec<_>>()
             .join(" ");
-        writeln!(w, "{size},{winner},{moves}").map_err(|e| e.to_string())?;
+        writeln!(w, "{size},{winner},1,-,-,{moves},{result},6.5").map_err(|e| e.to_string())?;
         if g % 100 == 99 {
             w.flush().map_err(|e| e.to_string())?;
         }
@@ -228,7 +444,7 @@ pub fn heuristic_move(b: &GoBoard, legal: &[usize], rng: &mut Rng) -> usize {
         }
         let before = b.cells.iter().filter(|&&x| x == -b.turn).count();
         let mut n = b.clone();
-        n.play(a).unwrap();
+        n.play_for_analysis(a).unwrap();
         let after = n.cells.iter().filter(|&&x| x == b.turn).count();
         let captured = (before - after) as f32;
         let r = (a / b.size) as f32;
@@ -243,30 +459,529 @@ pub fn load_games(path: &str) -> Result<Vec<GoGame>, String> {
     let mut out = Vec::new();
     for line in BufReader::new(File::open(path).map_err(|e| e.to_string())?).lines() {
         let line = line.map_err(|e| e.to_string())?;
-        let mut p = line.splitn(3, ',');
-        let size = p
-            .next()
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<_> = line.splitn(8, ',').collect();
+        let size = fields
+            .first()
             .ok_or("bad Go row")?
             .parse()
             .map_err(|_| "bad size")?;
-        let winner = p
-            .next()
+        let winner = fields
+            .get(1)
             .ok_or("bad Go row")?
             .parse()
             .map_err(|_| "bad winner")?;
-        let moves = p
-            .next()
-            .unwrap_or("")
+        let (first_turn, black_setup, white_setup, moves_field) = if fields.len() == 3 {
+            (1, Vec::new(), Vec::new(), fields[2])
+        } else if (6..=8).contains(&fields.len()) {
+            (
+                fields[2].parse().map_err(|_| "bad Go turn")?,
+                parse_points(fields[3], size)?,
+                parse_points(fields[4], size)?,
+                fields[5],
+            )
+        } else {
+            return Err("bad Go row".into());
+        };
+        let moves = moves_field
             .split_whitespace()
             .map(|x| x.parse().map_err(|_| "bad move"))
             .collect::<Result<_, _>>()?;
+        GoBoard::with_setup(size, &black_setup, &white_setup, first_turn)?;
         out.push(GoGame {
             size,
             moves,
             winner,
+            result: fields
+                .get(6)
+                .filter(|result| **result != "-")
+                .map(|result| (*result).to_owned()),
+            komi: fields
+                .get(7)
+                .filter(|komi| **komi != "-")
+                .map(|komi| (*komi).to_owned()),
+            first_turn,
+            black_setup,
+            white_setup,
         });
     }
     Ok(out)
+}
+
+fn parse_points(value: &str, size: usize) -> Result<Vec<usize>, String> {
+    if value == "-" || value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(':')
+        .map(|point| {
+            let point = point.parse::<usize>().map_err(|_| "bad setup point")?;
+            if point >= size * size {
+                return Err("setup point outside board".into());
+            }
+            Ok(point)
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct SgfNode {
+    properties: Vec<(String, Vec<String>)>,
+}
+
+struct SgfTree {
+    sequence: Vec<SgfNode>,
+    variations: Vec<SgfTree>,
+}
+
+struct SgfParser<'a> {
+    input: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> SgfParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input: input.as_bytes(),
+            cursor: 0,
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .input
+            .get(self.cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.cursor += 1;
+        }
+    }
+
+    fn parse_collection(&mut self) -> Result<Vec<SgfTree>, String> {
+        let mut trees = Vec::new();
+        self.skip_whitespace();
+        while self.cursor < self.input.len() {
+            trees.push(self.parse_tree()?);
+            self.skip_whitespace();
+        }
+        if trees.is_empty() {
+            return Err("SGF contains no game trees".into());
+        }
+        Ok(trees)
+    }
+
+    fn parse_tree(&mut self) -> Result<SgfTree, String> {
+        self.expect(b'(')?;
+        self.skip_whitespace();
+        let mut sequence = Vec::new();
+        while self.peek() == Some(b';') {
+            sequence.push(self.parse_node()?);
+            self.skip_whitespace();
+        }
+        if sequence.is_empty() {
+            return Err("SGF game tree has no nodes".into());
+        }
+        let mut variations = Vec::new();
+        while self.peek() == Some(b'(') {
+            variations.push(self.parse_tree()?);
+            self.skip_whitespace();
+        }
+        self.expect(b')')?;
+        Ok(SgfTree {
+            sequence,
+            variations,
+        })
+    }
+
+    fn parse_node(&mut self) -> Result<SgfNode, String> {
+        self.expect(b';')?;
+        let mut node = SgfNode::default();
+        loop {
+            self.skip_whitespace();
+            if !self.peek().is_some_and(|byte| byte.is_ascii_uppercase()) {
+                break;
+            }
+            let start = self.cursor;
+            while self.peek().is_some_and(|byte| byte.is_ascii_uppercase()) {
+                self.cursor += 1;
+            }
+            let property = std::str::from_utf8(&self.input[start..self.cursor])
+                .map_err(|_| "invalid SGF property")?
+                .to_owned();
+            let mut values = Vec::new();
+            loop {
+                self.skip_whitespace();
+                if self.peek() != Some(b'[') {
+                    break;
+                }
+                values.push(self.parse_value()?);
+            }
+            if values.is_empty() {
+                return Err(format!("SGF property {property} has no value"));
+            }
+            node.properties.push((property, values));
+        }
+        Ok(node)
+    }
+
+    fn parse_value(&mut self) -> Result<String, String> {
+        self.expect(b'[')?;
+        let mut value = Vec::new();
+        loop {
+            let byte = *self
+                .input
+                .get(self.cursor)
+                .ok_or("unterminated SGF property value")?;
+            self.cursor += 1;
+            match byte {
+                b']' => return String::from_utf8(value).map_err(|_| "invalid UTF-8 in SGF".into()),
+                b'\\' => {
+                    let escaped = *self
+                        .input
+                        .get(self.cursor)
+                        .ok_or("unterminated SGF escape")?;
+                    self.cursor += 1;
+                    if escaped == b'\n' {
+                        continue;
+                    }
+                    if escaped == b'\r' {
+                        if self.input.get(self.cursor) == Some(&b'\n') {
+                            self.cursor += 1;
+                        }
+                        continue;
+                    }
+                    value.push(escaped);
+                }
+                _ => value.push(byte),
+            }
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.cursor).copied()
+    }
+
+    fn expect(&mut self, expected: u8) -> Result<(), String> {
+        if self.peek() != Some(expected) {
+            return Err(format!(
+                "invalid SGF structure at byte {}: expected {}",
+                self.cursor, expected as char
+            ));
+        }
+        self.cursor += 1;
+        Ok(())
+    }
+}
+
+fn property_values<'a>(node: &'a SgfNode, name: &str) -> Vec<&'a str> {
+    node.properties
+        .iter()
+        .filter(|(property, _)| property == name)
+        .flat_map(|(_, values)| values.iter().map(String::as_str))
+        .collect()
+}
+
+fn mainline_nodes(tree: &SgfTree) -> Vec<&SgfNode> {
+    let mut nodes: Vec<_> = tree.sequence.iter().collect();
+    if let Some(first_variation) = tree.variations.first() {
+        nodes.extend(mainline_nodes(first_variation));
+    }
+    nodes
+}
+
+fn sgf_point(value: &str, size: usize) -> Result<usize, String> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 2 || !bytes.iter().all(u8::is_ascii_lowercase) {
+        return Err(format!("invalid SGF coordinate: {value}"));
+    }
+    let col = (bytes[0] - b'a') as usize;
+    let row = (bytes[1] - b'a') as usize;
+    if row >= size || col >= size {
+        return Err(format!(
+            "SGF coordinate outside {size}x{size} board: {value}"
+        ));
+    }
+    Ok(row * size + col)
+}
+
+fn sgf_setup_points(values: &[&str], size: usize) -> Result<Vec<usize>, String> {
+    let mut points = Vec::new();
+    for value in values {
+        let mut bounds = value.split(':');
+        let start = sgf_point(bounds.next().unwrap_or(""), size)?;
+        let end = match bounds.next() {
+            Some(point) => sgf_point(point, size)?,
+            None => start,
+        };
+        if bounds.next().is_some() {
+            return Err(format!("invalid SGF setup range: {value}"));
+        }
+        let (first_row, last_row) = (start / size, end / size);
+        let (first_col, last_col) = (start % size, end % size);
+        for row in first_row.min(last_row)..=first_row.max(last_row) {
+            for col in first_col.min(last_col)..=first_col.max(last_col) {
+                points.push(row * size + col);
+            }
+        }
+    }
+    points.sort_unstable();
+    points.dedup();
+    Ok(points)
+}
+
+fn sgf_move(value: &str, size: usize) -> Result<usize, String> {
+    if value.is_empty() || value == "tt" {
+        return Ok(size * size);
+    }
+    sgf_point(value, size)
+}
+
+fn parse_sgf_game(tree: &SgfTree) -> Result<Option<GoGame>, String> {
+    let nodes = mainline_nodes(tree);
+    let root = nodes.first().ok_or("empty SGF main line")?;
+    if property_values(root, "GM")
+        .first()
+        .is_some_and(|&game| game != "1")
+    {
+        return Ok(None);
+    }
+    let size = property_values(root, "SZ")
+        .first()
+        .map_or(Ok(19usize), |value| {
+            value.parse().map_err(|_| "unsupported SGF board size")
+        })?;
+    GoBoard::new(size)?;
+    let result = property_values(root, "RE").first().copied().unwrap_or("");
+    let winner = match result {
+        value if value.starts_with("B+") => 1,
+        value if value.starts_with("W+") => -1,
+        "0" | "Draw" | "Jigo" => 0,
+        _ => return Ok(None),
+    };
+    let komi = match property_values(root, "KM").first() {
+        Some(value) => {
+            let parsed = value.parse::<f32>().map_err(|_| "invalid SGF komi")?;
+            if !parsed.is_finite() {
+                return Err("invalid SGF komi".into());
+            }
+            Some((*value).to_owned())
+        }
+        None => None,
+    };
+
+    let mut black_setup = sgf_setup_points(&property_values(root, "AB"), size)?;
+    let mut white_setup = sgf_setup_points(&property_values(root, "AW"), size)?;
+    let removed = sgf_setup_points(&property_values(root, "AE"), size)?;
+    black_setup.retain(|point| !removed.contains(point));
+    white_setup.retain(|point| !removed.contains(point));
+    let first_turn = match property_values(root, "PL").first().copied() {
+        Some("B") => 1,
+        Some("W") => -1,
+        Some(_) => return Err("invalid SGF player-to-move property".into()),
+        None if black_setup.len() > 1 => -1,
+        None => 1,
+    };
+    let mut board = GoBoard::with_setup(size, &black_setup, &white_setup, first_turn)?;
+    let mut moves = Vec::new();
+    for node in nodes {
+        let black_moves = property_values(node, "B");
+        let white_moves = property_values(node, "W");
+        if black_moves.is_empty() && white_moves.is_empty() {
+            continue;
+        }
+        if black_moves.len() + white_moves.len() != 1 {
+            return Err("SGF node must contain exactly one move".into());
+        }
+        let (color, value) = if let Some(value) = black_moves.first() {
+            (1, *value)
+        } else {
+            (-1, white_moves[0])
+        };
+        if board.turn != color {
+            return Err(format!(
+                "SGF move color mismatch at ply {}",
+                moves.len() + 1
+            ));
+        }
+        let action = sgf_move(value, size)?;
+        board
+            .play(action)
+            .map_err(|error| format!("illegal SGF move at ply {}: {error}", moves.len() + 1))?;
+        moves.push(action);
+    }
+    Ok(Some(GoGame {
+        size,
+        moves,
+        winner,
+        result: Some(result.to_owned()),
+        komi,
+        first_turn,
+        black_setup,
+        white_setup,
+    }))
+}
+
+#[derive(Debug, Default)]
+pub struct SgfImportStats {
+    pub imported: usize,
+    pub skipped: usize,
+}
+
+fn collect_sgf_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    if path.is_file() {
+        files.push(path.to_path_buf());
+        return Ok(());
+    }
+    for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_sgf_files(&entry_path, files)?;
+        } else if entry_path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sgf"))
+        {
+            files.push(entry_path);
+        }
+    }
+    Ok(())
+}
+
+pub fn import_sgf(input: &str, output: &str) -> Result<SgfImportStats, String> {
+    let input_path = Path::new(input);
+    let mut files = Vec::new();
+    collect_sgf_files(input_path, &mut files)?;
+    files.sort();
+    if files.is_empty() {
+        return Err("no SGF files found".into());
+    }
+
+    let mut games = Vec::new();
+    let mut stats = SgfImportStats::default();
+    for path in files {
+        let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let trees = SgfParser::new(&text)
+            .parse_collection()
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        for tree in trees {
+            match parse_sgf_game(&tree).map_err(|error| format!("{}: {error}", path.display()))? {
+                Some(game) => {
+                    games.push(game);
+                    stats.imported += 1;
+                }
+                None => stats.skipped += 1,
+            }
+        }
+    }
+    save_games(output, &games)?;
+    Ok(stats)
+}
+
+pub fn save_games(path: &str, games: &[GoGame]) -> Result<(), String> {
+    let mut writer = BufWriter::new(File::create(path).map_err(|error| error.to_string())?);
+    for game in games {
+        let black_setup = serialize_points(&game.black_setup);
+        let white_setup = serialize_points(&game.white_setup);
+        let moves = game
+            .moves
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        writeln!(
+            writer,
+            "{},{},{},{},{},{},{},{}",
+            game.size,
+            game.winner,
+            game.first_turn,
+            black_setup,
+            white_setup,
+            moves,
+            game.result.as_deref().unwrap_or("-"),
+            game.komi.as_deref().unwrap_or("-")
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn export_sgf(input: &str, output: &str) -> Result<usize, String> {
+    let games = load_games(input)?;
+    let mut writer = BufWriter::new(File::create(output).map_err(|error| error.to_string())?);
+    for (index, game) in games.iter().enumerate() {
+        let result = game
+            .result
+            .as_deref()
+            .ok_or_else(|| format!("game {} has no SGF result metadata", index + 1))?;
+        let mut board = GoBoard::with_setup(
+            game.size,
+            &game.black_setup,
+            &game.white_setup,
+            game.first_turn,
+        )?;
+        write!(writer, "(;GM[1]FF[4]CA[UTF-8]SZ[{}]", game.size)
+            .map_err(|error| error.to_string())?;
+        if let Some(komi) = &game.komi {
+            write!(writer, "KM[{}]", escape_sgf_value(komi)).map_err(|error| error.to_string())?;
+        }
+        write!(writer, "RE[{}]", escape_sgf_value(result)).map_err(|error| error.to_string())?;
+        for &point in &game.black_setup {
+            write!(writer, "AB[{}]", sgf_coordinate(point, game.size))
+                .map_err(|error| error.to_string())?;
+        }
+        for &point in &game.white_setup {
+            write!(writer, "AW[{}]", sgf_coordinate(point, game.size))
+                .map_err(|error| error.to_string())?;
+        }
+        if game.first_turn == -1 {
+            write!(writer, "PL[W]").map_err(|error| error.to_string())?;
+        }
+        for &action in &game.moves {
+            let color = if board.turn == 1 { 'B' } else { 'W' };
+            if action == board.pass_action() {
+                write!(writer, ";{color}[]").map_err(|error| error.to_string())?;
+            } else {
+                write!(writer, ";{color}[{}]", sgf_coordinate(action, game.size))
+                    .map_err(|error| error.to_string())?;
+            }
+            board
+                .play(action)
+                .map_err(|error| format!("game {} contains an illegal move: {error}", index + 1))?;
+        }
+        writeln!(writer, ")").map_err(|error| error.to_string())?;
+    }
+    Ok(games.len())
+}
+
+fn sgf_coordinate(point: usize, size: usize) -> String {
+    let col = (point % size) as u8;
+    let row = (point / size) as u8;
+    String::from_utf8(vec![b'a' + col, b'a' + row]).expect("ASCII SGF coordinate")
+}
+
+fn escape_sgf_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn serialize_points(points: &[usize]) -> String {
+    if points.is_empty() {
+        "-".into()
+    } else {
+        points
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(":")
+    }
 }
 
 #[derive(Clone)]
@@ -296,7 +1011,7 @@ impl GoModel {
         let mut scored = Vec::new();
         for a in b.legal_moves() {
             let mut next = b.clone();
-            next.play(a).unwrap();
+            next.play_for_analysis(a).unwrap();
             let s = Self::dot(&self.policy[a * f..(a + 1) * f], &x) - self.value(&next);
             scored.push((s, rng.next_u64(), a));
         }
@@ -317,10 +1032,19 @@ impl GoModel {
                 if game.size != self.size {
                     continue;
                 }
-                let mut b = GoBoard::new(self.size)?;
+                let mut b = GoBoard::with_setup(
+                    self.size,
+                    &game.black_setup,
+                    &game.white_setup,
+                    game.first_turn,
+                )?;
                 for &action in &game.moves {
                     let x = b.features();
-                    let target = if game.winner == b.turn { 1.0 } else { -1.0 };
+                    let target = match game.winner {
+                        0 => 0.0,
+                        winner if winner == b.turn => 1.0,
+                        _ => -1.0,
+                    };
                     let pred = self.value(&b);
                     let err = target - pred;
                     let legal = b.legal_moves();
@@ -434,5 +1158,157 @@ mod tests {
     fn empty_score_is_komi() {
         let b = GoBoard::new(9).unwrap();
         assert_eq!(b.score_black(6.5), -6.5);
+    }
+
+    #[test]
+    fn optimized_legal_moves_match_play_validation() {
+        let mut rng = Rng::new(42);
+        for size in [5, 9, 19] {
+            let mut board = GoBoard::new(size).unwrap();
+            for _ in 0..100 {
+                let expected: Vec<_> = (0..board.cells.len())
+                    .filter(|&action| {
+                        if board.cells[action] != 0 {
+                            return false;
+                        }
+                        let mut next = board.clone();
+                        next.play(action).is_ok()
+                    })
+                    .chain(std::iter::once(board.pass_action()))
+                    .collect();
+                assert_eq!(board.legal_moves(), expected, "board size {size}");
+                if board.terminal() {
+                    break;
+                }
+                let moves = &expected[..expected.len() - 1];
+                let action = if moves.is_empty() {
+                    board.pass_action()
+                } else {
+                    moves[rng.usize(moves.len())]
+                };
+                board.play(action).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn illegal_suicide_does_not_change_board() {
+        let mut board = GoBoard::new(5).unwrap();
+        for point in [7, 11, 13, 17] {
+            board.cells[point] = -1;
+        }
+        let before = board.clone();
+        assert_eq!(board.play(12), Err("illegal suicide".into()));
+        assert_eq!(board.cells, before.cells);
+        assert_eq!(board.turn, before.turn);
+        assert_eq!(board.moves, before.moves);
+    }
+
+    #[test]
+    fn positional_superko_rejects_repeated_positions() {
+        let mut board = GoBoard::new(5).unwrap();
+        let action = 12;
+        let (groups, liberties, group_hashes) = board.group_liberties();
+        let repeated = board.position_hash_after_play(
+            action,
+            &groups,
+            &liberties,
+            &group_hashes,
+            board.position_hash(),
+        );
+        Arc::make_mut(&mut board.position_history).insert(repeated);
+        let before = board.cells.clone();
+
+        assert_eq!(board.play(action), Err("illegal positional superko".into()));
+        assert!(!board.legal_moves().contains(&action));
+        assert_eq!(board.cells, before);
+        assert_eq!(board.turn, 1);
+        assert_eq!(board.moves, 0);
+    }
+
+    #[test]
+    fn pass_is_allowed_without_recording_a_repeated_position() {
+        let mut board = GoBoard::new(5).unwrap();
+        let initial_history_len = board.position_history.len();
+        board.play(board.pass_action()).unwrap();
+
+        assert_eq!(board.position_history.len(), initial_history_len);
+        assert!(board.legal_moves().contains(&board.pass_action()));
+    }
+
+    #[test]
+    fn sgf_import_handles_setup_passes_escapes_and_mainline() {
+        let sgf = r"(;GM[1]FF[4]SZ[5]KM[0.50]RE[W+R]AB[aa:bb]PL[W]C[escaped \] bracket];W[cc];B[];W[dd](;B[ee])(;B[de]))";
+        let trees = SgfParser::new(sgf).parse_collection().unwrap();
+        let game = parse_sgf_game(&trees[0]).unwrap().unwrap();
+
+        assert_eq!(game.size, 5);
+        assert_eq!(game.winner, -1);
+        assert_eq!(game.komi.as_deref(), Some("0.50"));
+        assert_eq!(game.first_turn, -1);
+        assert_eq!(game.black_setup, vec![0, 1, 5, 6]);
+        assert_eq!(game.moves, vec![12, 25, 18, 24]);
+    }
+
+    #[test]
+    fn go_dataset_roundtrips_setup_and_legacy_rows() {
+        let path = std::env::temp_dir().join(format!("neurofour-go-{}.csv", std::process::id()));
+        let games = [GoGame {
+            size: 5,
+            moves: vec![12, 25],
+            winner: 0,
+            result: Some("0".into()),
+            komi: Some("6.5".into()),
+            first_turn: -1,
+            black_setup: vec![0, 1],
+            white_setup: vec![23],
+        }];
+        save_games(path.to_str().unwrap(), &games).unwrap();
+        let loaded = load_games(path.to_str().unwrap()).unwrap();
+        std::fs::write(&path, "5,1,12 25\n").unwrap();
+        let legacy = load_games(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(loaded[0].first_turn, -1);
+        assert_eq!(loaded[0].black_setup, vec![0, 1]);
+        assert_eq!(loaded[0].white_setup, vec![23]);
+        assert_eq!(loaded[0].winner, 0);
+        assert_eq!(loaded[0].result.as_deref(), Some("0"));
+        assert_eq!(loaded[0].komi.as_deref(), Some("6.5"));
+        assert_eq!(legacy[0].first_turn, 1);
+        assert!(legacy[0].black_setup.is_empty());
+    }
+
+    #[test]
+    fn sgf_export_and_import_preserve_record_metadata() {
+        let base = std::env::temp_dir().join(format!("neurofour-sgf-{}", std::process::id()));
+        let data = base.with_extension("csv");
+        let sgf = base.with_extension("sgf");
+        let imported = base.with_extension("roundtrip.csv");
+        let games = [GoGame {
+            size: 5,
+            moves: vec![12, 25, 18],
+            winner: -1,
+            result: Some("W+R".into()),
+            komi: Some("0.50".into()),
+            first_turn: -1,
+            black_setup: vec![0, 5],
+            white_setup: vec![24],
+        }];
+        save_games(data.to_str().unwrap(), &games).unwrap();
+        export_sgf(data.to_str().unwrap(), sgf.to_str().unwrap()).unwrap();
+        import_sgf(sgf.to_str().unwrap(), imported.to_str().unwrap()).unwrap();
+        let roundtrip = load_games(imported.to_str().unwrap()).unwrap();
+        for path in [&data, &sgf, &imported] {
+            std::fs::remove_file(path).unwrap();
+        }
+
+        assert_eq!(roundtrip[0].size, games[0].size);
+        assert_eq!(roundtrip[0].moves, games[0].moves);
+        assert_eq!(roundtrip[0].winner, games[0].winner);
+        assert_eq!(roundtrip[0].result, games[0].result);
+        assert_eq!(roundtrip[0].first_turn, games[0].first_turn);
+        assert_eq!(roundtrip[0].black_setup, games[0].black_setup);
+        assert_eq!(roundtrip[0].white_setup, games[0].white_setup);
     }
 }
