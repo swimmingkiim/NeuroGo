@@ -361,7 +361,7 @@ unzip -o data/go/kgs-2019-04.zip -d data/go/kgs-2019-04
 cargo run --release -- go-import-sgf \
   data/go/kgs-2019-04 data/go/kgs-2019-04.csv
 cargo run --release -- go-train \
-  data/go/kgs-2019-04.csv checkpoints/go/kgs-2019-04.ngo 1 42
+  data/go/kgs-2019-04.csv checkpoints/go/kgs-2019-04.ngo 3 42 0.1 42
 cargo run --release -- go-benchmark \
   checkpoints/go/kgs-2019-04.ngo 10 777
 cargo run --release -- go-benchmark \
@@ -376,7 +376,9 @@ cargo run --release -- go-export-sgf \
 
 선형 policy/value 모델은 현재 플레이어 기준 komi를 보드 면적으로 정규화한 입력 feature로 사용합니다. 예전 `NGO1` 체크포인트도 로드할 수 있으며 새 형식 `NGO2`로 저장할 때 komi 가중치는 0으로 초기화되어 기존 출력이 유지됩니다. `go-benchmark`의 선택 인자 `[komi=6.5]`로 기본값 이외의 komi도 지정할 수 있습니다.
 
-KGS 데이터 1,231판·232,601착을 1 epoch 학습한 최신 결과는 7.73초, loss `.141306`입니다. 기존 `NGO1` 체크포인트 로드 후 벤치마크도 확인했습니다. 새 체크포인트는 seed 777로 komi 0.5와 6.5에서 각각 random 및 heuristic 상대와 10판씩 대국했으며 모두 0승이었습니다. 이는 실행 및 komi 입력 경로의 smoke test이지 실력 평가가 아닙니다.
+`go-train`은 기본적으로 게임 단위 90/10 train/validation 분할을 수행합니다. 분할은 마지막 인자 `split_seed`로 재현되며 같은 기보의 착수들이 두 집합으로 나뉘지 않습니다. 그 앞의 `validation_fraction`은 기본 0.1이며, `0`은 전체 데이터 학습(검증 비활성화), `0 < 비율 < 1`은 검증 활성화입니다. 검증이 켜져 있으면 epoch마다 held-out MSE를 측정하고 가장 좋은 epoch의 체크포인트를 보존합니다. 초기 validation MSE, 선택된 epoch, train/validation MSE, 평가 착수 수를 출력합니다. 검증 MSE는 기력 대국 결과를 대체하지 않습니다.
+
+학습 업데이트도 바로잡았습니다. value 예측은 게임 기록의 komi를 사용하고, `tanh` 출력 미분을 반영한 작은 SGD step을 적용합니다. 그 전에는 기본 komi로 예측하면서 입력 feature는 게임별 komi를 사용했고, 비선형 출력의 gradient도 누락되어 validation MSE가 악화됐습니다. KGS 1,231판에서 split seed 42로 고정한 분할은 학습 1,108판, 검증 123판(23,541착)이었습니다. 3 epoch 한도에서 train seed 42/43/44를 평가하면 세 경우 모두 epoch 1이 선택됐으며, validation MSE는 각각 `.981204`, `.975292`, `.978290`(평균 `.978262`)이었습니다. 초기 baseline `1.000000`보다 평균 약 2.17% 낮지만, 개선 폭은 작고 같은 검증 분할에 한정된 결과입니다. 강도 향상으로 해석할 수 없습니다. 이전 전체 학습의 loss `.141306`은 검증 분할 도입 전 결과라 새 MSE와 직접 비교할 수 없습니다. 기존 `NGO1` 체크포인트 로드 후 벤치마크도 확인했습니다. komi 0.5와 6.5의 각 10판 smoke 대국에서 random 및 heuristic 상대에 모두 0승이었습니다.
 
 합법 수 계산은 빈 칸마다 보드를 복제해 착수 가능 여부를 확인하는 대신, 한 번의 보드 순회로 각 돌 그룹의 활로 수를 계산한 뒤 인접 그룹만 검사합니다. positional superko는 64비트 위치 해시 집합으로 확인하고, 평가용 임시 착수는 history를 복제하지 않습니다. 이 변경 후 같은 seed의 생성 시간은 9×9 200판에서 2.16초→1.29초, 19×19 30판에서 13.56초→6.65초였습니다. 환경에 따라 시간은 달라집니다.
 
@@ -387,4 +389,4 @@ KGS 데이터 1,231판·232,601착을 1 epoch 학습한 최신 결과는 7.73초
 
 19×19 데이터는 30판에서 300판으로 늘렸지만, 평가 상대별 10판은 여전히 실력 결론에 부족합니다. 특히 내장 heuristic은 포획과 중앙 선호만 사용하는 약한 상대이며 같은 계열의 self-play 데이터도 강한 기력을 보장하지 않습니다. 따라서 이 결과는 개선된 생성 속도와 19×19 규칙→데이터→학습→체크포인트→대국 경로를 확인하는 smoke benchmark입니다.
 
-현재 Go 모델은 완성된 동적 희소 모델이 아니라 공정 비교를 위한 선형 하한선입니다. SGF 입출력과 KGS 공개 기보 학습까지 연결했지만, ownership·score·활로 보조 head, 지역 연결을 가진 동적 희소 trunk, policy 상위 수를 확장하는 제한 MCTS, GNU Go/Pachi/KataGo 고정 예산 대국은 아직 남아 있습니다. 강도 비교 전에는 게임 단위 train/validation 분리, 여러 seed, 최소 수천 판의 평가도 추가해야 합니다. 현재 KGS smoke 평가만으로 KataGo와 실력을 비교하면 안 됩니다.
+현재 Go 모델은 완성된 동적 희소 모델이 아니라 공정 비교를 위한 선형 하한선입니다. SGF 입출력과 KGS 공개 기보 학습, 게임 단위 validation 및 best-epoch 보존은 연결했지만, validation 개선은 작고 한 split에서만 확인했습니다. 여러 독립 split과 더 큰 공개 기보에서 재검증한 뒤 ownership·score·활로 보조 head, 지역 연결을 가진 동적 희소 trunk, policy 상위 수를 확장하는 제한 MCTS, GNU Go/Pachi/KataGo 고정 예산 대국 및 최소 수천 판 평가가 남아 있습니다. 현재 KGS smoke 평가만으로 KataGo와 실력을 비교하면 안 됩니다.

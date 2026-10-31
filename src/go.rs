@@ -564,6 +564,46 @@ pub fn validate_game(game: &GoGame) -> Result<(), String> {
     Ok(())
 }
 
+pub fn split_games(
+    games: &[GoGame],
+    size: usize,
+    validation_fraction: f32,
+    seed: u64,
+) -> Result<(Vec<GoGame>, Vec<GoGame>), String> {
+    if !validation_fraction.is_finite() || !(0.0..1.0).contains(&validation_fraction) {
+        return Err("Go validation fraction must be in [0, 1)".into());
+    }
+
+    let mut indices: Vec<_> = games
+        .iter()
+        .enumerate()
+        .filter_map(|(index, game)| (game.size == size).then_some(index))
+        .collect();
+    if indices.is_empty() {
+        return Err(format!("no Go games for board size {size}"));
+    }
+
+    let validation_count = if validation_fraction == 0.0 {
+        0
+    } else {
+        if indices.len() < 2 {
+            return Err("Go validation split requires at least two games".into());
+        }
+        ((indices.len() as f32 * validation_fraction).round() as usize).clamp(1, indices.len() - 1)
+    };
+    Rng::new(seed).shuffle(&mut indices);
+
+    let validation = indices[..validation_count]
+        .iter()
+        .map(|&index| games[index].clone())
+        .collect();
+    let training = indices[validation_count..]
+        .iter()
+        .map(|&index| games[index].clone())
+        .collect();
+    Ok((training, validation))
+}
+
 fn parse_points(value: &str, size: usize) -> Result<Vec<usize>, String> {
     if value == "-" || value.is_empty() {
         return Ok(Vec::new());
@@ -1079,6 +1119,64 @@ impl GoModel {
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then_with(|| b.1.cmp(&a.1)));
         scored[0].2
     }
+    pub fn evaluate_loss(&self, games: &[GoGame]) -> Result<(f32, usize), String> {
+        let mut loss = 0.0;
+        let mut moves = 0;
+        for game in games.iter().filter(|game| game.size == self.size) {
+            validate_game(game)?;
+            let komi = game.komi_value()?;
+            let mut board = GoBoard::with_setup(
+                self.size,
+                &game.black_setup,
+                &game.white_setup,
+                game.first_turn,
+            )?;
+            for &action in &game.moves {
+                let target = match game.winner {
+                    0 => 0.0,
+                    winner if winner == board.turn => 1.0,
+                    _ => -1.0,
+                };
+                let error = target - self.value_with_komi(&board, komi);
+                loss += error * error;
+                moves += 1;
+                board.play(action)?;
+            }
+        }
+        if moves == 0 {
+            return Err("Go evaluation set contains no moves for this board size".into());
+        }
+        Ok((loss / moves as f32, moves))
+    }
+    pub fn train_with_validation(
+        &mut self,
+        training_games: &[GoGame],
+        validation_games: &[GoGame],
+        epochs: usize,
+        seed: u64,
+    ) -> Result<(usize, f32, f32), String> {
+        let (mut best_loss, _) = self.evaluate_loss(validation_games)?;
+        let mut best_model = self.clone();
+        let mut best_epoch = 0;
+        let mut best_train_loss = 0.0;
+        for epoch in 0..epochs {
+            let train_loss = self.train(training_games, 1, seed.wrapping_add(epoch as u64))?;
+            let (validation_loss, _) = self.evaluate_loss(validation_games)?;
+            if validation_loss < best_loss {
+                best_loss = validation_loss;
+                best_epoch = epoch + 1;
+                best_train_loss = train_loss;
+                best_model = self.clone();
+            }
+        }
+        *self = best_model;
+        let train_mse = if best_epoch == 0 {
+            best_train_loss
+        } else {
+            self.evaluate_loss(training_games)?.0
+        };
+        Ok((best_epoch, train_mse, best_loss))
+    }
     pub fn train(&mut self, games: &[GoGame], epochs: usize, seed: u64) -> Result<f32, String> {
         let mut rng = Rng::new(seed);
         let f = self.value.len();
@@ -1111,7 +1209,7 @@ impl GoModel {
                         winner if winner == b.turn => 1.0,
                         _ => -1.0,
                     };
-                    let pred = self.value(&b);
+                    let pred = self.value_with_komi(&b, komi);
                     let err = target - pred;
                     let legal = b.legal_moves();
                     let alternatives: Vec<_> = legal.into_iter().filter(|&a| a != action).collect();
@@ -1122,7 +1220,7 @@ impl GoModel {
                     };
                     for j in 0..f {
                         if x[j] != 0.0 {
-                            self.value[j] += 0.01 * err * x[j];
+                            self.value[j] += 0.00001 * err * (1.0 - pred * pred) * x[j];
                             self.policy[action * f + j] += 0.002 * x[j];
                             if let Some(other) = negative {
                                 self.policy[other * f + j] -= 0.002 * x[j];
@@ -1412,6 +1510,89 @@ mod tests {
         invalid_move.result = None;
         invalid_move.moves = vec![25, 25, 12];
         assert!(validate_game(&invalid_move).is_err());
+    }
+
+    #[test]
+    fn game_split_is_seeded_and_keeps_games_disjoint() {
+        let games: Vec<_> = (0..5)
+            .map(|action| GoGame {
+                size: 5,
+                moves: vec![action],
+                winner: 1,
+                result: None,
+                komi: None,
+                first_turn: 1,
+                black_setup: Vec::new(),
+                white_setup: Vec::new(),
+            })
+            .collect();
+        let (training, validation) = split_games(&games, 5, 0.2, 17).unwrap();
+        let (repeat_training, repeat_validation) = split_games(&games, 5, 0.2, 17).unwrap();
+
+        assert_eq!(training.len(), 4);
+        assert_eq!(validation.len(), 1);
+        assert_eq!(
+            training.iter().map(|game| &game.moves).collect::<Vec<_>>(),
+            repeat_training
+                .iter()
+                .map(|game| &game.moves)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            validation
+                .iter()
+                .map(|game| &game.moves)
+                .collect::<Vec<_>>(),
+            repeat_validation
+                .iter()
+                .map(|game| &game.moves)
+                .collect::<Vec<_>>()
+        );
+        assert!(training
+            .iter()
+            .all(|train| validation.iter().all(|valid| train.moves != valid.moves)));
+        assert!(split_games(&games[..1], 5, 0.2, 17).is_err());
+        assert!(split_games(&games, 5, 1.0, 17).is_err());
+    }
+
+    #[test]
+    fn model_evaluates_held_out_moves_without_training() {
+        let model = GoModel::new(5);
+        let game = GoGame {
+            size: 5,
+            moves: vec![0, 1],
+            winner: 1,
+            result: None,
+            komi: Some("0.5".into()),
+            first_turn: 1,
+            black_setup: Vec::new(),
+            white_setup: Vec::new(),
+        };
+
+        assert_eq!(model.evaluate_loss(&[game]).unwrap(), (1.0, 2));
+        assert!(model.evaluate_loss(&[]).is_err());
+    }
+
+    #[test]
+    fn validated_training_keeps_the_best_model() {
+        let game = GoGame {
+            size: 5,
+            moves: vec![12],
+            winner: 1,
+            result: None,
+            komi: Some("0.5".into()),
+            first_turn: 1,
+            black_setup: Vec::new(),
+            white_setup: Vec::new(),
+        };
+        let mut model = GoModel::new(5);
+        let (best_epoch, _, best_loss) = model
+            .train_with_validation(&[game.clone()], &[game.clone()], 2, 42)
+            .unwrap();
+
+        assert!(best_epoch > 0);
+        assert!(best_loss < 1.0);
+        assert_eq!(model.evaluate_loss(&[game]).unwrap().0, best_loss);
     }
 
     #[test]

@@ -13,7 +13,28 @@ use std::{collections::BTreeSet, fs::File, io::Write};
 use std::{env, process, time::Instant};
 
 fn usage() {
-    eprintln!("neurofour <command>\n  generate <file> [games] [seed]\n  import-uci <uci.csv> <native.csv>\n  import-pons <pons.json> <native.csv>\n  import-solver <solver-output> <native.csv>\n  import-zenodo <optimal.csv> <native.csv> [position_limit=100000]\n  merge <output.csv> <input.csv>...\n  mine-hard <checkpoint> <sequences.txt> [games=500] [seed=42] [min_ply=18]\n  train <data> <checkpoint> [max_epochs] [seed] [max_nodes] [top_k] [max_edges_per_node] [patience]\n  train-policy <zenodo.csv> <policy> [positions=100000] [epochs=3] [seed=42] [hard_analysis] [hard_repeat=1]\n  go-generate <size> <games> <file> [seed=42]\n  go-import-sgf <sgf-file-or-directory> <data.csv>\n  go-export-sgf <data.csv> <sgf-file>\n  go-train <data> <model> [epochs=2] [seed=42]\n  go-benchmark <model> [games=20] [seed=42] [komi=6.5]\n  eval <checkpoint> [opponent=random|heuristic|search] [games] [seed] [depth]\n  benchmark <checkpoint> [games] [seed]\n  benchmark-search <checkpoint> [model_depth=2] [games=100] [seed=42]\n  benchmark-hybrid <value> <policy> [depth=2] [policy_weight=.1] [games=100] [seed=42]\n  inspect <checkpoint>");
+    eprintln!(concat!(
+        "neurofour <command>\n",
+        "  generate <file> [games] [seed]\n",
+        "  import-uci <uci.csv> <native.csv>\n",
+        "  import-pons <pons.json> <native.csv>\n",
+        "  import-solver <solver-output> <native.csv>\n",
+        "  import-zenodo <optimal.csv> <native.csv> [position_limit=100000]\n",
+        "  merge <output.csv> <input.csv>...\n",
+        "  mine-hard <checkpoint> <sequences.txt> [games=500] [seed=42] [min_ply=18]\n",
+        "  train <data> <checkpoint> [max_epochs] [seed] [max_nodes] [top_k] [max_edges_per_node] [patience]\n",
+        "  train-policy <zenodo.csv> <policy> [positions=100000] [epochs=3] [seed=42] [hard_analysis] [hard_repeat=1]\n",
+        "  go-generate <size> <games> <file> [seed=42]\n",
+        "  go-import-sgf <sgf-file-or-directory> <data.csv>\n",
+        "  go-export-sgf <data.csv> <sgf-file>\n",
+        "  go-train <data> <model> [epochs=2] [seed=42] [validation_fraction=0.1] [split_seed=42]\n",
+        "  go-benchmark <model> [games=20] [seed=42] [komi=6.5]\n",
+        "  eval <checkpoint> [opponent=random|heuristic|search] [games] [seed] [depth]\n",
+        "  benchmark <checkpoint> [games] [seed]\n",
+        "  benchmark-search <checkpoint> [model_depth=2] [games=100] [seed=42]\n",
+        "  benchmark-hybrid <value> <policy> [depth=2] [policy_weight=.1] [games=100] [seed=42]\n",
+        "  inspect <checkpoint>"
+    ));
 }
 fn val<T: std::str::FromStr>(xs: &[String], i: usize, default: T) -> T {
     xs.get(i).and_then(|s| s.parse().ok()).unwrap_or(default)
@@ -251,13 +272,55 @@ fn run() -> Result<(), String> {
             let output = a.get(3).ok_or("missing Go model")?;
             let epochs = val(&a, 4, 2usize);
             let seed = val(&a, 5, 42u64);
+            let validation_fraction = a
+                .get(6)
+                .map(|value| {
+                    value
+                        .parse::<f32>()
+                        .map_err(|_| "invalid Go validation fraction")
+                })
+                .transpose()?
+                .unwrap_or(0.1);
+            let split_seed = val(&a, 7, 42u64);
             let games = neurofour::go::load_games(data)?;
             let size = games.first().ok_or("empty Go data")?.size;
+            let (training_games, validation_games) =
+                neurofour::go::split_games(&games, size, validation_fraction, split_seed)?;
             let mut model = neurofour::go::GoModel::new(size);
             let t = Instant::now();
-            let loss = model.train(&games, epochs, seed)?;
+            let validation_baseline = if validation_games.is_empty() {
+                None
+            } else {
+                Some(model.evaluate_loss(&validation_games)?.0)
+            };
+            let (loss, best_epoch) = if validation_games.is_empty() {
+                (model.train(&training_games, epochs, seed)?, None)
+            } else {
+                let (best_epoch, loss, _) = model.train_with_validation(
+                    &training_games,
+                    &validation_games,
+                    epochs,
+                    seed,
+                )?;
+                (loss, Some(best_epoch))
+            };
+            let (validation_loss, validation_moves) = if validation_games.is_empty() {
+                (None, 0)
+            } else {
+                let (loss, moves) = model.evaluate_loss(&validation_games)?;
+                (Some(loss), moves)
+            };
             model.save(output)?;
-            println!("trained_go size={size} games={} epochs={epochs} loss={loss:.6} time_ms={} peak_ram_kb={} file={output}",games.len(),t.elapsed().as_millis(),memory_kb());
+            let validation_loss = validation_loss
+                .map(|loss| format!("{loss:.6}"))
+                .unwrap_or_else(|| "disabled".into());
+            let validation_baseline = validation_baseline
+                .map(|loss| format!("{loss:.6}"))
+                .unwrap_or_else(|| "disabled".into());
+            let best_epoch = best_epoch
+                .map(|epoch| epoch.to_string())
+                .unwrap_or_else(|| "disabled".into());
+            println!("trained_go size={size} train_games={} validation_games={} epochs={epochs} best_epoch={best_epoch} train_loss={loss:.6} validation_baseline_loss={validation_baseline} validation_loss={validation_loss} validation_moves={validation_moves} time_ms={} peak_ram_kb={} file={output}",training_games.len(),validation_games.len(),t.elapsed().as_millis(),memory_kb());
         }
         Some("go-benchmark") => {
             let model = neurofour::go::GoModel::load(a.get(2).ok_or("missing Go model")?)?;
