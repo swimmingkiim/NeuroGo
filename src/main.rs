@@ -30,6 +30,7 @@ fn usage() {
         "  go-train <data> <model> [epochs=2] [seed=42] [validation_fraction=0.1] [split_seed=42]\n",
         "  go-evaluate <model> <data.csv>\n",
         "  go-benchmark <model> [games=20] [seed=42] [komi=6.5]\n",
+        "  go-benchmark-gtp <model> <engine> <games> <seed> <komi> [engine-arg ...]\n",
         "  eval <checkpoint> [opponent=random|heuristic|search] [games] [seed] [depth]\n",
         "  benchmark <checkpoint> [games] [seed]\n",
         "  benchmark-search <checkpoint> [model_depth=2] [games=100] [seed=42]\n",
@@ -350,6 +351,28 @@ fn run() -> Result<(), String> {
                     neurofour::go::benchmark_with_komi(&model, games, seed, heuristic, komi)?;
                 println!("go_size={} opponent={} games={games} komi={komi} W-L={w}-{l} win_rate={:.3} time_ms={} peak_ram_kb={}",model.size,if heuristic{"heuristic"}else{"random"},w as f64/games as f64,t.elapsed().as_millis(),memory_kb());
             }
+        }
+        Some("go-benchmark-gtp") => {
+            let model = neurofour::go::GoModel::load(a.get(2).ok_or("missing Go model")?)?;
+            let engine = a.get(3).ok_or("missing GTP engine")?;
+            let games = a
+                .get(4)
+                .ok_or("missing GTP benchmark game count")?
+                .parse::<usize>()
+                .map_err(|_| "invalid GTP benchmark game count")?;
+            let seed = a
+                .get(5)
+                .ok_or("missing GTP benchmark seed")?
+                .parse::<u64>()
+                .map_err(|_| "invalid GTP benchmark seed")?;
+            let komi = a
+                .get(6)
+                .ok_or("missing GTP benchmark komi")?
+                .parse::<f32>()
+                .map_err(|_| "invalid GTP benchmark komi")?;
+            let t = Instant::now();
+            let results = neurofour::go::benchmark_gtp(&model, engine, &a[7..], games, seed, komi)?;
+            println!("go_gtp_benchmark board_size={} engine={engine} games={games} W-L-D={}-{}-{} score={:.3} model_black={}-{}-{} model_white={}-{}-{} time_ms={} peak_ram_kb={}",model.size,results.wins,results.losses,results.draws,(results.wins as f64 + results.draws as f64 * 0.5) / games as f64,results.model_black.0,results.model_black.1,results.model_black.2,results.model_white.0,results.model_white.1,results.model_white.2,t.elapsed().as_millis(),memory_kb());
         }
         Some("eval") => {
             let cp = a.get(2).ok_or("missing checkpoint")?;

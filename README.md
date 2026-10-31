@@ -444,4 +444,25 @@ cargo run --release -- go-evaluate \
 
 19×19 데이터는 30판에서 300판으로 늘렸지만, 평가 상대별 10판은 여전히 실력 결론에 부족합니다. 특히 내장 heuristic은 포획과 중앙 선호만 사용하는 약한 상대이며 같은 계열의 self-play 데이터도 강한 기력을 보장하지 않습니다. 따라서 이 결과는 개선된 생성 속도와 19×19 규칙→데이터→학습→체크포인트→대국 경로를 확인하는 smoke benchmark입니다.
 
-현재 Go 모델은 완성된 동적 희소 모델이 아니라 공정 비교를 위한 선형 하한선입니다. SGF 입출력과 KGS 2018·2019 공개 기보 학습, 게임 단위 validation 및 best-epoch 보존, 별도 기간 데이터셋 value/policy 평가를 연결했습니다. 독립 기간 평가는 가능해졌지만 동일 KGS 출처이며 중복 기보 탐지를 하지 않았으므로 다른 출처의 중복 없는 테스트셋이 여전히 필요합니다. 그 다음 ownership·score·활로 보조 head, 지역 연결을 가진 동적 희소 trunk, policy 상위 수를 확장하는 제한 MCTS, GNU Go/Pachi/KataGo 고정 예산 대국 및 최소 수천 판 평가가 남아 있습니다. 현재 결과만으로 KataGo와 실력을 비교하면 안 됩니다.
+### GNU Go 및 KataGo와 직접 대국
+
+`go-benchmark-gtp`로 색을 교대해 GTP 엔진과 대국했습니다. NeuroGo의 GTP 결과에 흑/백별 기록을 추가해 색 편향도 확인할 수 있습니다.
+
+| 상대 | 보드 및 NeuroGo 체크포인트 | 판수 | NeuroGo W-L-D | 설정 |
+|---|---|---:|---:|---|
+| GNU Go 3.8 | 9×9, `9x9.ngo` | 50 | 9-41-0 | Chinese rules, level 0 |
+| GNU Go 3.8 | 19×19, `kgs-2019-04.ngo` | 20 | 0-20-0 | Chinese rules, level 0 |
+| KataGo v1.18.1 | 19×19, `kgs-2019-04.ngo` | 50 | 25-25-0 | 소형 b6c64 네트워크, 32 visits/수, 검색 스레드 1개, komi 7.5, Chinese rules |
+
+KataGo 대국의 색별 결과는 NeuroGo가 흑일 때 0승 25패, 백일 때 25승 0패였습니다. 전체 50% 결과는 실력 동등을 뜻하지 않으며, 25판씩의 색별 표본만으로 결론을 내릴 수도 없습니다. KataGo에는 매 수 32 visits의 검색을 허용한 반면 NeuroGo는 선형 policy/value 한 번으로 착수를 정하므로 계산 예산도 대칭이 아닙니다. 이 결과는 강도나 Elo 측정이 아닌 저예산 실행 가능성 및 색별 성능을 확인한 예비 대국입니다. GNU Go도 level 0 설정의 기준선이며, 위 판수는 통계적으로 유의한 실력 평가에 부족합니다.
+
+재현에는 [KataGo v1.18.1 CPU release](https://github.com/lightvector/KataGo/releases/tag/v1.18.1)와 [공개 b6c64 네트워크](https://media.katagotraining.org/uploaded/networks/models_extra/lionffen_b6c64_3x3_v10.txt.gz)가 필요합니다. 네트워크는 19×19용 저연산 모델이며 최신 대형 KataGo 네트워크의 대표 결과가 아닙니다.
+
+```bash
+cargo run --release -- go-benchmark-gtp \
+  checkpoints/go/kgs-2019-04.ngo /path/to/katago 50 42 7.5 \
+  gtp -model /path/to/b6c64.txt.gz -config /path/to/default_gtp.cfg \
+  -override-config maxVisits=32,numSearchThreads=1,rules=chinese,ponderingEnabled=false
+```
+
+현재 Go 모델은 완성된 동적 희소 모델이 아니라 비교용 선형 하한선입니다. SGF 입출력과 KGS 2018·2019 공개 기보 학습, 게임 단위 validation 및 best-epoch 보존, 별도 기간 데이터셋 value/policy 평가를 연결했습니다. 독립 기간 평가는 가능해졌지만 동일 KGS 출처이며 중복 기보 탐지를 하지 않았으므로 다른 출처의 중복 없는 테스트셋이 여전히 필요합니다. 다음 단계로 ownership·score·활로 보조 head, 지역 연결을 가진 동적 희소 trunk, policy 상위 수를 확장하는 제한 MCTS, 색별 결과와 다중 seed를 포함한 GNU Go/Pachi/KataGo 고정 예산 대국을 확장하고 최소 수천 판으로 평가해야 합니다. 현재 직접 대국은 이와 같은 실력 비교를 대신하지 않습니다.

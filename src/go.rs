@@ -4,6 +4,7 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
+    process::{ChildStdin, ChildStdout, Command, Stdio},
     sync::Arc,
 };
 
@@ -1444,9 +1445,241 @@ pub fn benchmark_with_komi(
     Ok((wins, games - wins))
 }
 
+fn gtp_query(
+    input: &mut BufWriter<ChildStdin>,
+    output: &mut BufReader<ChildStdout>,
+    command: &str,
+) -> Result<String, String> {
+    writeln!(input, "{command}").map_err(|error| error.to_string())?;
+    input.flush().map_err(|error| error.to_string())?;
+
+    let mut response = Vec::new();
+    loop {
+        let mut line = String::new();
+        if output
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?
+            == 0
+        {
+            return Err(format!("GTP engine closed stdout during `{command}`"));
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        response.push(line);
+    }
+
+    let response = response.join("").trim().to_owned();
+    if let Some(error) = response.strip_prefix('?') {
+        return Err(format!("GTP engine rejected `{command}`: {}", error.trim()));
+    }
+    response
+        .strip_prefix('=')
+        .map(|payload| payload.trim().to_owned())
+        .ok_or_else(|| format!("invalid GTP response to `{command}`: {response}"))
+}
+
+fn gtp_color(color: i8) -> &'static str {
+    if color == 1 {
+        "black"
+    } else {
+        "white"
+    }
+}
+
+fn gtp_vertex(action: usize, board: &GoBoard) -> String {
+    if action == board.pass_action() {
+        return "pass".into();
+    }
+    let mut column = b'A' + (action % board.size) as u8;
+    if column >= b'I' {
+        column += 1;
+    }
+    let row = board.size - action / board.size;
+    format!("{}{}", column as char, row)
+}
+
+fn parse_gtp_vertex(vertex: &str, board: &GoBoard) -> Result<Option<usize>, String> {
+    if vertex.eq_ignore_ascii_case("pass") {
+        return Ok(Some(board.pass_action()));
+    }
+    if vertex.eq_ignore_ascii_case("resign") {
+        return Ok(None);
+    }
+    let bytes = vertex.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() {
+        return Err(format!("invalid GTP move: {vertex}"));
+    }
+    let column = bytes[0].to_ascii_uppercase();
+    if column == b'I' {
+        return Err(format!("invalid GTP column: {vertex}"));
+    }
+    let mut col = (column - b'A') as usize;
+    if column > b'I' {
+        col -= 1;
+    }
+    let row = std::str::from_utf8(&bytes[1..])
+        .map_err(|_| format!("invalid GTP row: {vertex}"))?
+        .parse::<usize>()
+        .map_err(|_| format!("invalid GTP row: {vertex}"))?;
+    if col >= board.size || !(1..=board.size).contains(&row) {
+        return Err(format!(
+            "GTP move outside {}x{} board: {vertex}",
+            board.size, board.size
+        ));
+    }
+    Ok(Some((board.size - row) * board.size + col))
+}
+
+pub fn benchmark_gtp(
+    model: &GoModel,
+    engine: &str,
+    engine_args: &[String],
+    games: usize,
+    seed: u64,
+    komi: f32,
+) -> Result<GtpBenchmarkResults, String> {
+    if games == 0 {
+        return Err("GTP benchmark requires at least one game".into());
+    }
+    if !komi.is_finite() {
+        return Err("invalid Go komi".into());
+    }
+    let mut child = Command::new(engine)
+        .args(engine_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("failed to start GTP engine `{engine}`: {error}"))?;
+    let mut input = BufWriter::new(child.stdin.take().ok_or("missing GTP engine stdin")?);
+    let mut output = BufReader::new(child.stdout.take().ok_or("missing GTP engine stdout")?);
+    let result = (|| {
+        let mut rng = Rng::new(seed);
+        let mut results = GtpBenchmarkResults::default();
+        for game_index in 0..games {
+            gtp_query(
+                &mut input,
+                &mut output,
+                &format!("boardsize {}", model.size),
+            )?;
+            gtp_query(&mut input, &mut output, "clear_board")?;
+            gtp_query(&mut input, &mut output, &format!("komi {komi}"))?;
+            let model_color = if game_index % 2 == 0 { 1 } else { -1 };
+            let mut board = GoBoard::new(model.size)?;
+            let mut resigned = false;
+            while !board.terminal() {
+                if board.turn == model_color {
+                    let action = model.choose_with_komi(&board, &mut rng, komi);
+                    gtp_query(
+                        &mut input,
+                        &mut output,
+                        &format!(
+                            "play {} {}",
+                            gtp_color(board.turn),
+                            gtp_vertex(action, &board)
+                        ),
+                    )?;
+                    board.play(action)?;
+                } else {
+                    let vertex = gtp_query(
+                        &mut input,
+                        &mut output,
+                        &format!("genmove {}", gtp_color(board.turn)),
+                    )?;
+                    let Some(action) = parse_gtp_vertex(&vertex, &board)? else {
+                        resigned = true;
+                        break;
+                    };
+                    if !board.legal_moves().contains(&action) {
+                        return Err(format!(
+                            "GTP engine returned illegal move {vertex} in game {}",
+                            game_index + 1
+                        ));
+                    }
+                    board.play(action)?;
+                }
+            }
+            if resigned {
+                results.record(model_color, Some(true));
+            } else {
+                let score = board.score_black(komi);
+                let model_score = score * model_color as f32;
+                if model_score > 0.0 {
+                    results.record(model_color, Some(true));
+                } else if model_score < 0.0 {
+                    results.record(model_color, Some(false));
+                } else {
+                    results.record(model_color, None);
+                }
+            }
+        }
+        Ok(results)
+    })();
+
+    match result {
+        Ok(stats) => {
+            let _ = gtp_query(&mut input, &mut output, "quit");
+            child.wait().map_err(|error| error.to_string())?;
+            Ok(stats)
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct GtpBenchmarkResults {
+    pub wins: usize,
+    pub losses: usize,
+    pub draws: usize,
+    pub model_black: (usize, usize, usize),
+    pub model_white: (usize, usize, usize),
+}
+
+impl GtpBenchmarkResults {
+    fn record(&mut self, model_color: i8, win: Option<bool>) {
+        let color_results = if model_color == 1 {
+            &mut self.model_black
+        } else {
+            &mut self.model_white
+        };
+        match win {
+            Some(true) => {
+                self.wins += 1;
+                color_results.0 += 1;
+            }
+            Some(false) => {
+                self.losses += 1;
+                color_results.1 += 1;
+            }
+            None => {
+                self.draws += 1;
+                color_results.2 += 1;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gtp_benchmark_results_track_outcomes_by_color() {
+        let mut results = GtpBenchmarkResults::default();
+        results.record(1, Some(true));
+        results.record(-1, Some(false));
+        results.record(-1, None);
+
+        assert_eq!((results.wins, results.losses, results.draws), (1, 1, 1));
+        assert_eq!(results.model_black, (1, 0, 0));
+        assert_eq!(results.model_white, (0, 1, 1));
+    }
+
     #[test]
     fn capture_and_suicide() {
         let mut b = GoBoard::new(5).unwrap();
