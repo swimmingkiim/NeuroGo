@@ -1,1 +1,10 @@
-data/zenodo-optimal/Optimal_Move_Dataset.csv
+# Local build output
+/target/
+/.git-neurogo/
+
+# Large generated assets and datasets
+/data/
+/checkpoints/
+
+# OS noise
+.DS_Store
