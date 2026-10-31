@@ -353,32 +353,87 @@ cargo run --release -- go-benchmark checkpoints/go/19x19.ngo 10 777
 [U-Go KGS 기보 아카이브](https://www.u-go.net/gamerecords/)의 2019년 4월 파일은 KGS가 사용을 허가한 7단 이상(또는 양쪽 6단) 대국 1,255판입니다. 주석과 변형 수가 제거되어 있고, 압축 파일에는 SGF 기록이 들어 있습니다.
 
 ```bash
-mkdir -p data/go/kgs-2019-04
+mkdir -p data/go/kgs-2019-03-04
+curl -L --fail \
+  https://dl.u-go.net/gamerecords/KGS-2019_03-19-1478-.zip \
+  -o data/go/kgs-2019-03.zip
 curl -L --fail \
   https://dl.u-go.net/gamerecords/KGS-2019_04-19-1255-.zip \
   -o data/go/kgs-2019-04.zip
-unzip -o data/go/kgs-2019-04.zip -d data/go/kgs-2019-04
+unzip -o data/go/kgs-2019-03.zip -d data/go/kgs-2019-03-04
+unzip -o data/go/kgs-2019-04.zip -d data/go/kgs-2019-03-04
 cargo run --release -- go-import-sgf \
-  data/go/kgs-2019-04 data/go/kgs-2019-04.csv
+  data/go/kgs-2019-03-04 data/go/kgs-2019-03-04.csv
+cargo run --release -- go-import-sgf \
+  data/go/kgs-2019-03-04/kgs-19-2019-03-new data/go/kgs-2019-03.csv
+cargo run --release -- go-import-sgf \
+  data/go/kgs-2019-03-04/kgs-19-2019-04-new data/go/kgs-2019-04-independent.csv
+cargo run --release -- go-import-sgf \
+  data/go/kgs-2018-04 data/go/kgs-2018-04.csv
 cargo run --release -- go-train \
-  data/go/kgs-2019-04.csv checkpoints/go/kgs-2019-04.ngo 3 42 0.1 42
+  data/go/kgs-2019-03-04.csv checkpoints/go/kgs-2019-03-04.ngo 3 42 0.1 101
+cargo run --release -- go-train \
+  data/go/kgs-2019-03.csv checkpoints/go/kgs-march-train.ngo 3 42 0 42
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-march-train.ngo data/go/kgs-2019-04-independent.csv
+cargo run --release -- go-train \
+  data/go/kgs-2019-03-04.csv checkpoints/go/kgs-2019-train-for-2018-test.ngo 3 42 0 42
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-2019-train-for-2018-test.ngo data/go/kgs-2018-04.csv
+cargo run --release -- go-train \
+  data/go/kgs-2018-04.csv checkpoints/go/kgs-2018-train-for-2019-test.ngo 3 42 0 42
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-2018-train-for-2019-test.ngo data/go/kgs-2019-03-04.csv
 cargo run --release -- go-benchmark \
-  checkpoints/go/kgs-2019-04.ngo 10 777
+  checkpoints/go/kgs-2019-03-04.ngo 10 777
 cargo run --release -- go-benchmark \
-  checkpoints/go/kgs-2019-04.ngo 10 777 0.5
+  checkpoints/go/kgs-2019-03-04.ngo 10 777 0.5
 cargo run --release -- go-export-sgf \
-  data/go/kgs-2019-04.csv data/go/kgs-2019-04-export.sgf
+  data/go/kgs-2019-03-04.csv data/go/kgs-2019-03-04-export.sgf
 ```
 
-`go-import-sgf`는 SGF 파일 하나 또는 디렉터리의 `.sgf` 파일을 읽고, 각 컬렉션의 첫 번째 변형을 주계보로 사용합니다. 보드 크기, 승패/무승부, 패스, 핸디캡 배치(`AB`/`AW`/`AE`), 다음 차례(`PL`)를 가져오며 모든 착수를 현재 규칙과 positional superko로 검증합니다. 결과가 없거나 Go 이외 게임인 기록은 건너뜁니다. 현재 아카이브에서는 1,231판을 가져오고 24판을 제외했습니다. `go-export-sgf`는 지원 데이터 형식의 게임을 SGF로 출력하며, `RE` 결과 문자열도 보존합니다.
+`go-import-sgf`는 SGF 파일 하나 또는 디렉터리의 `.sgf` 파일을 읽고, 각 컬렉션의 첫 번째 변형을 주계보로 사용합니다. 보드 크기, 승패/무승부, 패스, 핸디캡 배치(`AB`/`AW`/`AE`), 다음 차례(`PL`)를 가져오며 첫 착수 전 여러 노드에 걸친 setup도 적용하고 모든 착수를 positional superko로 검증합니다. 잘못된 UTF-8 메타데이터는 대체 문자로 복구합니다. 결과가 없거나 Go 이외 게임인 기록은 건너뜁니다. 기본은 잘못된 SGF에서 실패하며, 선택 인자 `skip_invalid=true`는 손상·불법 기록을 건너뛰고 최대 5개 이유를 출력합니다. [U-Go KGS 아카이브](https://www.u-go.net/gamerecords/)의 2019년 3월(1,478판)과 4월(1,255판) 자료는 사용 허가와 함께 제공됩니다. 합쳐서 2,733개 SGF 중 2,681판·502,157착을 가져오고 52판을 제외했습니다. 같은 아카이브의 2018년 4월(1,612판) 자료에서는 1,582판을 가져오고 30판을 제외했습니다. `go-export-sgf`는 지원 데이터 형식의 게임을 SGF로 출력하며, `RE` 결과 문자열도 보존합니다.
+
+### 다른 플랫폼 기보로 교차 평가
+
+[featurecat/go-dataset](https://github.com/featurecat/go-dataset)은 Fox 서버에서 수집한 게임 아카이브를 제공하며 저장소의 라이선스는 GPL-3.0입니다. 아래 재현 실험은 `Pro/7p`, `Pro/8p`와 `Pro2` 아카이브만 사용합니다. 저장소 전체 데이터가 필요하지 않습니다.
+
+```bash
+mkdir -p data/go/fox-pro-2019
+curl -L --fail \
+  https://raw.githubusercontent.com/featurecat/go-dataset/master/Pro/Pro.7z \
+  -o data/go/fox-pro-Pro.7z
+curl -L --fail \
+  https://raw.githubusercontent.com/featurecat/go-dataset/master/Pro/Pro2.7z \
+  -o data/go/fox-pro-Pro2.7z
+7z x -y -odata/go/fox-pro-2019 data/go/fox-pro-Pro.7z \
+  'Pro/7p/*' 'Pro/8p/*'
+7z x -y -odata/go/fox-pro-2019 data/go/fox-pro-Pro2.7z
+cargo run --release -- go-import-sgf \
+  data/go/fox-pro-2019 data/go/fox-pro-2019.csv true
+cargo run --release -- go-train \
+  data/go/kgs-2019-03-04.csv checkpoints/go/kgs-cross-source.ngo 3 42 0 42
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-cross-source.ngo data/go/fox-pro-2019.csv
+```
+
+선택된 Fox 아카이브 1,994개 중 1,947판을 가져왔고, 결과 없는 8판과 불법 색 순서 등 검증 실패 39판은 제외했습니다. 두 데이터셋의 보드 크기와 전체 착수 수열을 비교했을 때 정확히 일치하는 게임은 없었습니다. KGS 2019 2,681판으로 3 epoch 학습 후 Fox 1,947판(369,858착) 평가 결과는 value MSE `1.064625`, policy top-1 `.003983`(합법 수 균등 기준 `.004142`)이었습니다. 반대 방향(Fox 학습 후 KGS 평가)은 MSE `1.008095`, policy top-1 `.011680`(기준 `.004395`)이었습니다. 초기 value baseline MSE `1.0`과 무작위 policy 기준을 한 방향씩 넘지 못해 플랫폼 간 일반화 증거가 없습니다. 서로 다른 플랫폼이라도 플레이어/대국 중복이 완전히 없다고 보장할 수 없으며, top-1은 대국 승률 지표가 아닙니다.
 
 학습용 CSV 형식은 `size,winner,first_turn,black_setup,white_setup,moves,result,komi`입니다. setup 위치는 보드의 0 기반 인덱스를 `:`로 구분하며 빈 setup은 `-`입니다. 기존 7열 CSV와 `size,winner,moves` 행도 계속 읽을 수 있으며, komi 누락 행은 6.5로 처리합니다. 기록을 적재할 때 winner/result 일치, komi 유효성, 모든 착수의 합법성 및 종료 후 추가 착수를 검증합니다. SGF 왕복 시 승패·착수·핸디캡·차례·결과·komi를 보존합니다.
 
 선형 policy/value 모델은 현재 플레이어 기준 komi를 보드 면적으로 정규화한 입력 feature로 사용합니다. 예전 `NGO1` 체크포인트도 로드할 수 있으며 새 형식 `NGO2`로 저장할 때 komi 가중치는 0으로 초기화되어 기존 출력이 유지됩니다. `go-benchmark`의 선택 인자 `[komi=6.5]`로 기본값 이외의 komi도 지정할 수 있습니다.
 
-`go-train`은 기본적으로 게임 단위 90/10 train/validation 분할을 수행합니다. 분할은 마지막 인자 `split_seed`로 재현되며 같은 기보의 착수들이 두 집합으로 나뉘지 않습니다. 그 앞의 `validation_fraction`은 기본 0.1이며, `0`은 전체 데이터 학습(검증 비활성화), `0 < 비율 < 1`은 검증 활성화입니다. 검증이 켜져 있으면 epoch마다 held-out MSE를 측정하고 가장 좋은 epoch의 체크포인트를 보존합니다. 초기 validation MSE, 선택된 epoch, train/validation MSE, 평가 착수 수를 출력합니다. 검증 MSE는 기력 대국 결과를 대체하지 않습니다.
+`go-train`은 기본적으로 게임 단위 90/10 train/validation 분할을 수행합니다. 분할은 마지막 인자 `split_seed`로 재현되며 같은 기보의 착수들이 두 집합으로 나뉘지 않습니다. 그 앞의 `validation_fraction`은 기본 0.1이며, `0`은 전체 데이터 학습(검증 비활성화), `0 < 비율 < 1`은 검증 활성화입니다. 검증이 켜져 있으면 epoch마다 held-out MSE를 측정하고 가장 좋은 epoch의 체크포인트를 보존합니다. 초기 validation MSE, 선택된 epoch, train/validation MSE, 평가 착수 수를 출력합니다. `go-evaluate <model> <data.csv>`는 별도 데이터셋에서 value MSE와 policy-only logits의 top-1 정확도를 평가합니다(실제 착수 선택 시 사용하는 value 보정 전 점수). policy 동점은 균등 무작위 tie-break 기대값으로 처리하며, 비교용 random top-1 기준선은 각 상태의 합법 수 수에 따른 기대 정확도입니다. 검증 지표는 기력 대국 결과를 대체하지 않습니다.
 
-학습 업데이트도 바로잡았습니다. value 예측은 게임 기록의 komi를 사용하고, `tanh` 출력 미분을 반영한 작은 SGD step을 적용합니다. 그 전에는 기본 komi로 예측하면서 입력 feature는 게임별 komi를 사용했고, 비선형 출력의 gradient도 누락되어 validation MSE가 악화됐습니다. KGS 1,231판에서 split seed 42로 고정한 분할은 학습 1,108판, 검증 123판(23,541착)이었습니다. 3 epoch 한도에서 train seed 42/43/44를 평가하면 세 경우 모두 epoch 1이 선택됐으며, validation MSE는 각각 `.981204`, `.975292`, `.978290`(평균 `.978262`)이었습니다. 초기 baseline `1.000000`보다 평균 약 2.17% 낮지만, 개선 폭은 작고 같은 검증 분할에 한정된 결과입니다. 강도 향상으로 해석할 수 없습니다. 이전 전체 학습의 loss `.141306`은 검증 분할 도입 전 결과라 새 MSE와 직접 비교할 수 없습니다. 기존 `NGO1` 체크포인트 로드 후 벤치마크도 확인했습니다. komi 0.5와 6.5의 각 10판 smoke 대국에서 random 및 heuristic 상대에 모두 0승이었습니다.
+학습 업데이트도 바로잡았습니다. value 예측은 게임 기록의 komi를 사용하고, `tanh` 출력 미분을 반영한 작은 SGD step을 적용합니다. 그 전에는 기본 komi로 예측하면서 입력 feature는 게임별 komi를 사용했고, 비선형 출력의 gradient도 누락되어 validation MSE가 악화됐습니다.
+
+확장된 KGS 2,681판에서 서로 다른 `split_seed` 101/202/303/404/505로 각 90/10 게임 분할을 만들고, 매번 학습 seed 42로 1 epoch 학습했습니다. 검증 MSE는 `.908022`, `.980100`, `.915063`, `.997209`, `.918172`로 평균 `.943713`(표준편차 `.041632`)이었습니다. 5개 모두 초기 baseline `1.000000`보다 낮았지만 split 간 편차가 크고 한 split은 baseline과 거의 같았습니다. 고정 split 101에서 학습 seed 42/43/44로 각각 최대 3 epoch을 실행한 경우 모두 epoch 1이 선택됐고 MSE는 `.908022`, `.915860`, `.914421`(평균 `.912768`, 표준편차 `.004172`)이었습니다. 즉 이 설정은 학습 seed보다 validation game 구성에 더 민감합니다.
+
+월별 파일을 나눈 시간 방향 평가도 수행했습니다. 3월 1,450판으로 3 epoch 학습 후 4월의 1,231판(232,601착)에서 value MSE `.982330`, policy top-1 `.007833`을 기록했습니다(합법 수 균등 선택 기준 `.004479`). 반대로 4월 학습 후 3월의 1,450판(269,556착)을 평가하면 MSE `.952306`, top-1 `.013930`(기준 `.004322`)이었습니다.
+
+더 먼 기간 확인을 위해 2018년 4월 아카이브를 별도 테스트로 사용했습니다. 2019년 3·4월 2,681판으로 3 epoch 학습한 모델은 2018년 4월 1,582판(304,466착)에서 value MSE `.974296`, policy top-1 `.008993`(합법 수 균등 기준 `.004392`)이었습니다. 반대 방향으로 2018년 4월 1,582판만 학습한 모델을 2019년 3·4월 2,681판(502,157착)에서 평가하면 MSE `.997448`, top-1 `.013430`(기준 `.004395`)이었습니다. 이는 2018↔2019 시간 이동 평가이며 같은 KGS 출처라는 한계가 있습니다. 중복 대국도 검사하지 않았습니다. policy top-1이 무작위 기준보다 높아도 착수 품질이나 대국 강도 개선을 보장하지 않으며, validation/test MSE는 기보 착수의 승패 기반 value target을 평가할 뿐 최종 점수 예측은 아닙니다.
+
+이전 1,231판 전체 학습의 loss `.141306`은 validation 분할 도입 전 결과라 새 MSE와 직접 비교할 수 없습니다. 기존 `NGO1` 체크포인트 로드 후 벤치마크도 확인했습니다. komi 0.5와 6.5의 각 10판 smoke 대국에서 random 및 heuristic 상대에 모두 0승이었습니다.
 
 합법 수 계산은 빈 칸마다 보드를 복제해 착수 가능 여부를 확인하는 대신, 한 번의 보드 순회로 각 돌 그룹의 활로 수를 계산한 뒤 인접 그룹만 검사합니다. positional superko는 64비트 위치 해시 집합으로 확인하고, 평가용 임시 착수는 history를 복제하지 않습니다. 이 변경 후 같은 seed의 생성 시간은 9×9 200판에서 2.16초→1.29초, 19×19 30판에서 13.56초→6.65초였습니다. 환경에 따라 시간은 달라집니다.
 
@@ -389,4 +444,4 @@ cargo run --release -- go-export-sgf \
 
 19×19 데이터는 30판에서 300판으로 늘렸지만, 평가 상대별 10판은 여전히 실력 결론에 부족합니다. 특히 내장 heuristic은 포획과 중앙 선호만 사용하는 약한 상대이며 같은 계열의 self-play 데이터도 강한 기력을 보장하지 않습니다. 따라서 이 결과는 개선된 생성 속도와 19×19 규칙→데이터→학습→체크포인트→대국 경로를 확인하는 smoke benchmark입니다.
 
-현재 Go 모델은 완성된 동적 희소 모델이 아니라 공정 비교를 위한 선형 하한선입니다. SGF 입출력과 KGS 공개 기보 학습, 게임 단위 validation 및 best-epoch 보존은 연결했지만, validation 개선은 작고 한 split에서만 확인했습니다. 여러 독립 split과 더 큰 공개 기보에서 재검증한 뒤 ownership·score·활로 보조 head, 지역 연결을 가진 동적 희소 trunk, policy 상위 수를 확장하는 제한 MCTS, GNU Go/Pachi/KataGo 고정 예산 대국 및 최소 수천 판 평가가 남아 있습니다. 현재 KGS smoke 평가만으로 KataGo와 실력을 비교하면 안 됩니다.
+현재 Go 모델은 완성된 동적 희소 모델이 아니라 공정 비교를 위한 선형 하한선입니다. SGF 입출력과 KGS 2018·2019 공개 기보 학습, 게임 단위 validation 및 best-epoch 보존, 별도 기간 데이터셋 value/policy 평가를 연결했습니다. 독립 기간 평가는 가능해졌지만 동일 KGS 출처이며 중복 기보 탐지를 하지 않았으므로 다른 출처의 중복 없는 테스트셋이 여전히 필요합니다. 그 다음 ownership·score·활로 보조 head, 지역 연결을 가진 동적 희소 trunk, policy 상위 수를 확장하는 제한 MCTS, GNU Go/Pachi/KataGo 고정 예산 대국 및 최소 수천 판 평가가 남아 있습니다. 현재 결과만으로 KataGo와 실력을 비교하면 안 됩니다.

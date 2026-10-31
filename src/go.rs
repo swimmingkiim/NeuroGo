@@ -865,21 +865,46 @@ fn parse_sgf_game(tree: &SgfTree) -> Result<Option<GoGame>, String> {
         None => None,
     };
 
-    let mut black_setup = sgf_setup_points(&property_values(root, "AB"), size)?;
-    let mut white_setup = sgf_setup_points(&property_values(root, "AW"), size)?;
-    let removed = sgf_setup_points(&property_values(root, "AE"), size)?;
-    black_setup.retain(|point| !removed.contains(point));
-    white_setup.retain(|point| !removed.contains(point));
-    let first_turn = match property_values(root, "PL").first().copied() {
-        Some("B") => 1,
-        Some("W") => -1,
-        Some(_) => return Err("invalid SGF player-to-move property".into()),
-        None if black_setup.len() > 1 => -1,
-        None => 1,
-    };
+    let mut black_setup = Vec::new();
+    let mut white_setup = Vec::new();
+    let mut player_to_move = None;
+    let mut first_move_node = nodes.len();
+    for (index, node) in nodes.iter().enumerate() {
+        let removed = sgf_setup_points(&property_values(node, "AE"), size)?;
+        black_setup.retain(|point| !removed.contains(point));
+        white_setup.retain(|point| !removed.contains(point));
+
+        let black_added = sgf_setup_points(&property_values(node, "AB"), size)?;
+        let white_added = sgf_setup_points(&property_values(node, "AW"), size)?;
+        if black_added.iter().any(|point| white_added.contains(point))
+            || black_added.iter().any(|point| white_setup.contains(point))
+            || white_added.iter().any(|point| black_setup.contains(point))
+        {
+            return Err("overlapping SGF setup stones".into());
+        }
+        black_setup.extend(black_added);
+        white_setup.extend(white_added);
+
+        if let Some(player) = property_values(node, "PL").first().copied() {
+            player_to_move = Some(match player {
+                "B" => 1,
+                "W" => -1,
+                _ => return Err("invalid SGF player-to-move property".into()),
+            });
+        }
+        if !property_values(node, "B").is_empty() || !property_values(node, "W").is_empty() {
+            first_move_node = index;
+            break;
+        }
+    }
+    black_setup.sort_unstable();
+    black_setup.dedup();
+    white_setup.sort_unstable();
+    white_setup.dedup();
+    let first_turn = player_to_move.unwrap_or(if black_setup.len() > 1 { -1 } else { 1 });
     let mut board = GoBoard::with_setup(size, &black_setup, &white_setup, first_turn)?;
     let mut moves = Vec::new();
-    for node in nodes {
+    for node in nodes.into_iter().skip(first_move_node) {
         let black_moves = property_values(node, "B");
         let white_moves = property_values(node, "W");
         if black_moves.is_empty() && white_moves.is_empty() {
@@ -921,6 +946,8 @@ fn parse_sgf_game(tree: &SgfTree) -> Result<Option<GoGame>, String> {
 pub struct SgfImportStats {
     pub imported: usize,
     pub skipped: usize,
+    pub invalid: usize,
+    pub invalid_examples: Vec<String>,
 }
 
 fn collect_sgf_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -944,6 +971,14 @@ fn collect_sgf_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String
 }
 
 pub fn import_sgf(input: &str, output: &str) -> Result<SgfImportStats, String> {
+    import_sgf_with_options(input, output, false)
+}
+
+pub fn import_sgf_with_options(
+    input: &str,
+    output: &str,
+    skip_invalid: bool,
+) -> Result<SgfImportStats, String> {
     let input_path = Path::new(input);
     let mut files = Vec::new();
     collect_sgf_files(input_path, &mut files)?;
@@ -955,17 +990,37 @@ pub fn import_sgf(input: &str, output: &str) -> Result<SgfImportStats, String> {
     let mut games = Vec::new();
     let mut stats = SgfImportStats::default();
     for path in files {
-        let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-        let trees = SgfParser::new(&text)
-            .parse_collection()
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        let text = String::from_utf8_lossy(&bytes);
+        let trees = match SgfParser::new(&text).parse_collection() {
+            Ok(trees) => trees,
+            Err(error) if skip_invalid => {
+                stats.invalid += 1;
+                if stats.invalid_examples.len() < 5 {
+                    stats
+                        .invalid_examples
+                        .push(format!("{}: {error}", path.display()));
+                }
+                continue;
+            }
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
         for tree in trees {
-            match parse_sgf_game(&tree).map_err(|error| format!("{}: {error}", path.display()))? {
-                Some(game) => {
+            match parse_sgf_game(&tree) {
+                Err(error) if skip_invalid => {
+                    stats.invalid += 1;
+                    if stats.invalid_examples.len() < 5 {
+                        stats
+                            .invalid_examples
+                            .push(format!("{}: {error}", path.display()));
+                    }
+                }
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+                Ok(Some(game)) => {
                     games.push(game);
                     stats.imported += 1;
                 }
-                None => stats.skipped += 1,
+                Ok(None) => stats.skipped += 1,
             }
         }
     }
@@ -1147,6 +1202,56 @@ impl GoModel {
             return Err("Go evaluation set contains no moves for this board size".into());
         }
         Ok((loss / moves as f32, moves))
+    }
+    pub fn evaluate_policy_top1(&self, games: &[GoGame]) -> Result<(f32, f32, usize), String> {
+        let mut correct = 0.0;
+        let mut random_correct = 0.0;
+        let mut moves = 0;
+        let features = self.value.len();
+        for game in games.iter().filter(|game| game.size == self.size) {
+            validate_game(game)?;
+            let komi = game.komi_value()?;
+            let mut board = GoBoard::with_setup(
+                self.size,
+                &game.black_setup,
+                &game.white_setup,
+                game.first_turn,
+            )?;
+            for &action in &game.moves {
+                let input = board.features_with_komi(komi);
+                let legal = board.legal_moves();
+                let mut best_score = f32::NEG_INFINITY;
+                let mut tied_best = 0;
+                let mut chosen_score = f32::NEG_INFINITY;
+                for candidate in legal.iter().copied() {
+                    let score = Self::dot(
+                        &self.policy[candidate * features..(candidate + 1) * features],
+                        &input,
+                    );
+                    if candidate == action {
+                        chosen_score = score;
+                    }
+                    match score.total_cmp(&best_score) {
+                        std::cmp::Ordering::Greater => {
+                            best_score = score;
+                            tied_best = 1;
+                        }
+                        std::cmp::Ordering::Equal => tied_best += 1,
+                        std::cmp::Ordering::Less => {}
+                    }
+                }
+                if chosen_score.total_cmp(&best_score) == std::cmp::Ordering::Equal {
+                    correct += 1.0 / tied_best as f32;
+                }
+                random_correct += 1.0 / legal.len() as f32;
+                moves += 1;
+                board.play(action)?;
+            }
+        }
+        if moves == 0 {
+            return Err("Go policy evaluation set contains no moves for this board size".into());
+        }
+        Ok((correct / moves as f32, random_correct / moves as f32, moves))
     }
     pub fn train_with_validation(
         &mut self,
@@ -1447,6 +1552,58 @@ mod tests {
     }
 
     #[test]
+    fn sgf_import_applies_handicap_setup_node_before_first_move() {
+        let sgf = "(;GM[1]FF[4]SZ[19]HA[4]RE[W+R];AB[pd][dp][dd][pp];W[cq];B[dq])";
+        let trees = SgfParser::new(sgf).parse_collection().unwrap();
+        let game = parse_sgf_game(&trees[0]).unwrap().unwrap();
+
+        assert_eq!(game.first_turn, -1);
+        assert_eq!(game.black_setup, vec![60, 72, 288, 300]);
+        assert_eq!(game.moves, vec![306, 307]);
+    }
+
+    #[test]
+    fn sgf_import_preserves_moves_with_invalid_utf8_metadata() {
+        let base = std::env::temp_dir().join(format!("neurofour-sgf-utf8-{}", std::process::id()));
+        let sgf = base.with_extension("sgf");
+        let csv = base.with_extension("csv");
+        std::fs::write(&sgf, b"(;GM[1]FF[4]SZ[5]RE[B+R]PB[\xff];B[aa];W[bb])").unwrap();
+
+        let stats = import_sgf(sgf.to_str().unwrap(), csv.to_str().unwrap()).unwrap();
+        let games = load_games(csv.to_str().unwrap()).unwrap();
+        std::fs::remove_file(sgf).unwrap();
+        std::fs::remove_file(csv).unwrap();
+
+        assert_eq!(stats.imported, 1);
+        assert_eq!(games[0].moves, vec![0, 6]);
+    }
+
+    #[test]
+    fn sgf_import_can_explicitly_skip_invalid_games_and_report_them() {
+        let base = std::env::temp_dir().join(format!("neurofour-sgf-skip-{}", std::process::id()));
+        let sgf = base.with_extension("sgf");
+        let csv = base.with_extension("csv");
+        std::fs::write(
+            &sgf,
+            "(;GM[1]FF[4]SZ[5]RE[B+R];B[aa];B[bb])(;GM[1]FF[4]SZ[5]RE[B+R];B[cc])",
+        )
+        .unwrap();
+
+        assert!(import_sgf(sgf.to_str().unwrap(), csv.to_str().unwrap()).is_err());
+        let stats =
+            import_sgf_with_options(sgf.to_str().unwrap(), csv.to_str().unwrap(), true).unwrap();
+        let games = load_games(csv.to_str().unwrap()).unwrap();
+        std::fs::remove_file(sgf).unwrap();
+        std::fs::remove_file(csv).unwrap();
+
+        assert_eq!(stats.imported, 1);
+        assert_eq!(stats.invalid, 1);
+        assert_eq!(stats.invalid_examples.len(), 1);
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].moves, vec![12]);
+    }
+
+    #[test]
     fn go_dataset_roundtrips_setup_and_legacy_rows() {
         let path = std::env::temp_dir().join(format!("neurofour-go-{}.csv", std::process::id()));
         let games = [GoGame {
@@ -1571,6 +1728,26 @@ mod tests {
 
         assert_eq!(model.evaluate_loss(&[game]).unwrap(), (1.0, 2));
         assert!(model.evaluate_loss(&[]).is_err());
+    }
+
+    #[test]
+    fn policy_top1_reports_tie_averaged_random_baseline() {
+        let model = GoModel::new(5);
+        let game = GoGame {
+            size: 5,
+            moves: vec![12, 13],
+            winner: 1,
+            result: None,
+            komi: Some("0.5".into()),
+            first_turn: 1,
+            black_setup: Vec::new(),
+            white_setup: Vec::new(),
+        };
+        let (accuracy, random_baseline, moves) = model.evaluate_policy_top1(&[game]).unwrap();
+
+        assert_eq!(accuracy, random_baseline);
+        assert_eq!(moves, 2);
+        assert!(model.evaluate_policy_top1(&[]).is_err());
     }
 
     #[test]

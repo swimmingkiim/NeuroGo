@@ -25,9 +25,10 @@ fn usage() {
         "  train <data> <checkpoint> [max_epochs] [seed] [max_nodes] [top_k] [max_edges_per_node] [patience]\n",
         "  train-policy <zenodo.csv> <policy> [positions=100000] [epochs=3] [seed=42] [hard_analysis] [hard_repeat=1]\n",
         "  go-generate <size> <games> <file> [seed=42]\n",
-        "  go-import-sgf <sgf-file-or-directory> <data.csv>\n",
+        "  go-import-sgf <sgf-file-or-directory> <data.csv> [skip_invalid=false]\n",
         "  go-export-sgf <data.csv> <sgf-file>\n",
         "  go-train <data> <model> [epochs=2] [seed=42] [validation_fraction=0.1] [split_seed=42]\n",
+        "  go-evaluate <model> <data.csv>\n",
         "  go-benchmark <model> [games=20] [seed=42] [komi=6.5]\n",
         "  eval <checkpoint> [opponent=random|heuristic|search] [games] [seed] [depth]\n",
         "  benchmark <checkpoint> [games] [seed]\n",
@@ -255,10 +256,18 @@ fn run() -> Result<(), String> {
         Some("go-import-sgf") => {
             let input = a.get(2).ok_or("missing SGF file or directory")?;
             let output = a.get(3).ok_or("missing Go data output")?;
-            let stats = neurofour::go::import_sgf(input, output)?;
+            let skip_invalid = match a.get(4).map(String::as_str) {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(_) => return Err("skip_invalid must be true or false".into()),
+            };
+            let stats = neurofour::go::import_sgf_with_options(input, output, skip_invalid)?;
+            for example in &stats.invalid_examples {
+                eprintln!("skipped_invalid_sgf {example}");
+            }
             println!(
-                "imported_sgf games={} skipped={} file={output}",
-                stats.imported, stats.skipped
+                "imported_sgf games={} skipped={} invalid={} file={output}",
+                stats.imported, stats.skipped, stats.invalid
             );
         }
         Some("go-export-sgf") => {
@@ -321,6 +330,14 @@ fn run() -> Result<(), String> {
                 .map(|epoch| epoch.to_string())
                 .unwrap_or_else(|| "disabled".into());
             println!("trained_go size={size} train_games={} validation_games={} epochs={epochs} best_epoch={best_epoch} train_loss={loss:.6} validation_baseline_loss={validation_baseline} validation_loss={validation_loss} validation_moves={validation_moves} time_ms={} peak_ram_kb={} file={output}",training_games.len(),validation_games.len(),t.elapsed().as_millis(),memory_kb());
+        }
+        Some("go-evaluate") => {
+            let model = neurofour::go::GoModel::load(a.get(2).ok_or("missing Go model")?)?;
+            let games = neurofour::go::load_games(a.get(3).ok_or("missing Go data")?)?;
+            let matching_games = games.iter().filter(|game| game.size == model.size).count();
+            let (value_mse, value_moves) = model.evaluate_loss(&games)?;
+            let (policy_top1, random_top1, policy_moves) = model.evaluate_policy_top1(&games)?;
+            println!("evaluated_go size={} games={matching_games} value_mse={value_mse:.6} value_moves={value_moves} policy_top1={policy_top1:.6} random_policy_top1={random_top1:.6} policy_moves={policy_moves}",model.size);
         }
         Some("go-benchmark") => {
             let model = neurofour::go::GoModel::load(a.get(2).ok_or("missing Go model")?)?;
