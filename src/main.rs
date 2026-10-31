@@ -27,8 +27,8 @@ fn usage() {
         "  go-generate <size> <games> <file> [seed=42]\n",
         "  go-import-sgf <sgf-file-or-directory> <data.csv> [skip_invalid=false]\n",
         "  go-export-sgf <data.csv> <sgf-file>\n",
-        "  go-train <data> <model.gns> [epochs=2] [seed=42] [validation_fraction=0.1] [split_seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [error_threshold=0.55] [novelty=0.2] [prune_strength=0.01] [growth_rule=0|1] [spatial_radius=0]\n",
-        "  go-distill <teacher-train.tsv> <teacher-validation.tsv> <model.gns> [epochs=5] [seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [spatial_radius=0]\n",
+        "  go-train <data> <model.gns> [epochs=2] [seed=42] [validation_fraction=0.1] [split_seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [error_threshold=0.55] [novelty=0.2] [prune_strength=0.01] [growth_rule=0|1|2] [spatial_radius=0] [activation_balance=0.2] [value_learning_rate=0.00001]\n",
+        "  go-distill <teacher-train.tsv> <teacher-validation.tsv> <model.gns> [epochs=5] [seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [spatial_radius=0] [activation_balance=0.2]\n",
         "  go-evaluate <model> <data.csv>\n",
         "  go-benchmark <model> [games=20] [seed=42] [komi=6.5]\n",
         "  go-benchmark-mcts <model> <games> <seed> <komi> <simulations> [cpuct=1.4] [opponent=heuristic|random]\n",
@@ -323,6 +323,10 @@ fn run() -> Result<(), String> {
                 parse_optional(&a, 14, "growth_rule")?.unwrap_or(config.growth_rule);
             config.spatial_radius =
                 parse_optional(&a, 15, "spatial_radius")?.unwrap_or(config.spatial_radius);
+            config.activation_balance =
+                parse_optional(&a, 16, "activation_balance")?.unwrap_or(config.activation_balance);
+            config.value_learning_rate = parse_optional(&a, 17, "value_learning_rate")?
+                .unwrap_or(config.value_learning_rate);
             let games = neurofour::go::load_games(data)?;
             let size = games.first().ok_or("empty Go data")?.size;
             let (training_games, validation_games) =
@@ -362,7 +366,8 @@ fn run() -> Result<(), String> {
             let best_epoch = best_epoch
                 .map(|epoch| epoch.to_string())
                 .unwrap_or_else(|| "disabled".into());
-            println!("trained_go architecture=dynamic_sparse size={size} nodes={} edges={} top_k={} max_nodes={} max_edges_per_node={} error_threshold={} novelty_threshold={} prune_strength={} growth_rule={} spatial_radius={} training_symmetries=8 policy_objective=legal_softmax early_stopping=policy_value_objective train_games={} validation_games={} epochs={epochs} best_epoch={best_epoch} train_loss={loss:.6} validation_baseline_loss={validation_baseline} validation_loss={validation_loss} validation_moves={validation_moves} time_ms={} peak_ram_kb={} file={output}",model.nodes.len(),model.edge_count(),model.cfg.top_k,model.cfg.max_nodes,model.cfg.max_edges_per_node,model.cfg.error_threshold,model.cfg.novelty_threshold,model.cfg.prune_strength,model.cfg.growth_rule,model.cfg.spatial_radius,training_games.len(),validation_games.len(),t.elapsed().as_millis(),memory_kb());
+            let (usage_nodes, used_nodes, mean_usage, max_usage) = model.neuron_usage_stats();
+            println!("trained_go architecture=dynamic_sparse size={size} nodes={} edges={} top_k={} max_nodes={} max_edges_per_node={} error_threshold={} novelty_threshold={} prune_strength={} growth_rule={} spatial_radius={} activation_balance={} value_learning_rate={} used_neurons={used_nodes}/{usage_nodes} mean_selection_rate={mean_usage:.6} max_selection_rate={max_usage:.6} training_symmetries=8 policy_objective=legal_softmax early_stopping=policy_value_objective train_games={} validation_games={} epochs={epochs} best_epoch={best_epoch} train_loss={loss:.6} validation_baseline_loss={validation_baseline} validation_loss={validation_loss} validation_moves={validation_moves} time_ms={} peak_ram_kb={} file={output}",model.nodes.len(),model.edge_count(),model.cfg.top_k,model.cfg.max_nodes,model.cfg.max_edges_per_node,model.cfg.error_threshold,model.cfg.novelty_threshold,model.cfg.prune_strength,model.cfg.growth_rule,model.cfg.spatial_radius,model.cfg.activation_balance,model.cfg.value_learning_rate,training_games.len(),validation_games.len(),t.elapsed().as_millis(),memory_kb());
         }
         Some("go-distill") => {
             let training_path = a.get(2).ok_or("missing teacher training dataset")?;
@@ -403,6 +408,8 @@ fn run() -> Result<(), String> {
                 parse_optional(&a, 9, "max_edges")?.unwrap_or(config.max_edges_per_node);
             config.spatial_radius =
                 parse_optional(&a, 10, "spatial_radius")?.unwrap_or(config.spatial_radius);
+            config.activation_balance =
+                parse_optional(&a, 11, "activation_balance")?.unwrap_or(config.activation_balance);
             let mut model = neurofour::go::GoSparseModel::new(size, config, seed)?;
             let baseline = model.evaluate_teacher_metrics(&validation)?;
             let t = Instant::now();
@@ -428,7 +435,8 @@ fn run() -> Result<(), String> {
             let matching_games = games.iter().filter(|game| game.size == model.size).count();
             let (value_mse, value_moves) = model.evaluate_loss(&games)?;
             let (policy_top1, random_top1, policy_moves) = model.evaluate_policy_top1(&games)?;
-            println!("evaluated_go architecture=dynamic_sparse size={} nodes={} edges={} games={matching_games} value_mse={value_mse:.6} value_moves={value_moves} policy_top1={policy_top1:.6} random_policy_top1={random_top1:.6} policy_moves={policy_moves}",model.size,model.nodes.len(),model.edge_count());
+            let (usage_nodes, used_nodes, mean_usage, max_usage) = model.neuron_usage_stats();
+            println!("evaluated_go architecture=dynamic_sparse size={} games={matching_games} nodes={} edges={} used_neurons={used_nodes}/{usage_nodes} mean_selection_rate={mean_usage:.6} max_selection_rate={max_usage:.6} activation_balance={} value_mse={value_mse:.6} value_moves={value_moves} policy_top1={policy_top1:.6} random_policy_top1={random_top1:.6} policy_moves={policy_moves}",model.size,model.nodes.len(),model.edge_count(),model.cfg.activation_balance);
         }
         Some("go-benchmark") => {
             let model = neurofour::go::GoSparseModel::load(a.get(2).ok_or("missing Go model")?)?;

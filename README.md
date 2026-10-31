@@ -591,6 +591,113 @@ cargo run --release -- go-benchmark-gtp-mcts \
   -override-config maxVisits=32,numSearchThreads=1,rules=chinese,ponderingEnabled=false
 ```
 
+### 뉴런 사용률 균형 및 gradient 기반 시냅스 성장
+
+2026-10-31에 기존 희소 기준선과 세 변경을 함께 적용한 모델을 같은 March 학습 데이터 1,450판, 게임 단위 90/10 분할, seed 42, 128 nodes/top-k 8/edge cap 16, 1 epoch으로 비교했습니다. 변경 모델은 과다 선택 뉴런에 activation penalty를 주고, 누적 입력 gradient credit을 이용해 새 시냅스 입력을 선택하며, value learning rate를 `.00001`에서 `.0001`로 높였습니다. 따라서 결과만으로 각 변경의 개별 효과를 분리할 수는 없습니다.
+
+| 모델 | Validation value MSE | April value MSE | April policy top-1 (random) | 노드 / 시냅스 | 사용 뉴런 / 최대 선택률 |
+|---|---:|---:|---:|---:|---:|
+| 기준선 | `.972687` | `.985838` | `.011427` (`.004479`) | 128 / 786 | 42 / 128, `.999994` |
+| usage balance + gradient-credit growth + 높은 value LR | `.926661` | `.968463` | `.011006` (`.004479`) | 128 / 932 | 53 / 128, `.474992` |
+
+독립 April 평가에서 value MSE는 `.017375` 낮아졌고, policy top-1은 `.000421` 낮아졌습니다. 개선 모델은 노드 선택 편중이 완화되고 연결 수가 늘었지만, top-1 개선은 관찰되지 않았습니다. 학습은 각각 약 150초, peak RAM은 약 27.6/28.0 MiB였습니다.
+
+실제 착수 품질 확인을 위해 각 체크포인트를 동일한 내장 heuristic과 16-simulation PUCT, `cpuct=1.4`, komi 6.5로 대국시켰습니다. 매 100판에서 모델 색을 교대했습니다.
+
+| 모델 | seed 20261031 | seed 20261101 | 합계 W-L-D | 승점률 (95% Wilson CI) |
+|---|---:|---:|---:|---:|
+| 기준선 | 35-65 | 44-56 | 79-121-0 / 200 | 39.5% (33.0–46.4%) |
+| 변경 모델 | 68-32 | 81-19 | 149-51-0 / 200 | 74.5% (68.0–80.0%) |
+
+이 결과는 학습 seed 42 하나의 탐색용 비교였습니다. 이후의 3-seed 요인 실험 및 대국에서 같은 승률 차이는 재현되지 않았으므로, 이 표만으로 변경의 효과를 주장하지 않습니다.
+
+재현 명령:
+
+```bash
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/usage-growth-baseline.gns \
+  1 42 0.1 42 128 8 16 0.55 0.2 0.01 0 0 0 0.00001
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/usage-growth-experiment.gns \
+  1 42 0.1 42 128 8 16 0.55 0.2 0.01 2 0 0.2 0.0001
+cargo run --release -- go-evaluate \
+  checkpoints/go/usage-growth-experiment.gns data/go/kgs-2019-04.csv
+cargo run --release -- go-benchmark-mcts \
+  checkpoints/go/usage-growth-experiment.gns 100 20261031 6.5 16 1.4 heuristic
+```
+
+### 뉴런 균형·시냅스 성장 3-seed 요인 검증
+
+세 변경의 기여를 분리하기 위해 activation balance (`0`/`0.2`), gradient-credit 성장 (`growth_rule=0`/`2`), value learning rate (`0.00001`/`0.0001`)의 `2×2×2` 전체 조합을 학습 seed 42, 43, 44에서 각각 실행했습니다. 총 24개 모델은 같은 1,450행 March 데이터, 동일한 게임 단위 분할(seed 42, 1,305 train/145 validation), 128 nodes, top-k 8, 최대 16개 입력 edge, 1 epoch을 사용했습니다. 표의 값은 3개 학습 seed 평균 ± 표준편차입니다.
+
+April 홀드아웃은 학습 게임과 수순·setup이 일치하는 두 행을 제외한 1,229판/232,601착수로 평가했습니다. 두 일치 행은 모두 착수가 없는 게임이므로 원본 파일을 평가해도 value/policy 지표는 동일합니다. KGS 2018 및 Fox holdout에는 학습 게임과 일치하는 수순이 없었습니다.
+
+| Balance | Growth rule | Value LR | Validation value MSE | April value MSE | April policy top-1 |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | `.00001` | `.9800 ± .0080` | `.987660 ± .002633` | `1.1836 ± .0371%` |
+| 0 | 0 | `.0001` | `.9331 ± .0243` | `.974206 ± .003330` | `1.1843 ± .0319%` |
+| 0 | 2 | `.00001` | `.9776 ± .0046` | `.986938 ± .001535` | `1.1788 ± .0749%` |
+| 0 | 2 | `.0001` | `.9294 ± .0064` | `.970367 ± .003700` | `1.1386 ± .0331%` |
+| `.2` | 0 | `.00001` | `.9808 ± .0046` | `.986571 ± .003145` | `1.2575 ± .0518%` |
+| `.2` | 0 | `.0001` | `.9442 ± .0079` | `.975684 ± .007971` | `1.2704 ± .0559%` |
+| `.2` | 2 | `.00001` | `.9790 ± .0022` | `.985996 ± .001144` | `1.2674 ± .1197%` |
+| `.2` | 2 | `.0001` | `.9326 ± .0082` | `.971045 ± .005169` | `1.2188 ± .1431%` |
+
+Policy top-1은 퍼센트이며 `±`는 학습 seed 간 표준편차(percentage points)입니다. April 균등 합법수 baseline은 `0.4479%`입니다. 요인별 paired 평균 효과(on minus off, 다른 두 요인과 seed에 걸쳐 평균)는 다음과 같습니다.
+
+- **Value LR 증가**가 value MSE 개선의 대부분을 설명했습니다: validation `-.0445 ± .0066`, April `-.0140 ± .0035`. April policy top-1에는 이득이 없었습니다(`-.0188` percentage points).
+- **Activation balance**는 뉴런 선택 편중을 낮췄습니다(무균형 모델의 최대 선택률 약 `1.0`, balance 적용 모델은 대략 `.39–.52`). April policy top-1은 평균 `+.0822` percentage points였지만 value MSE는 사실상 바뀌지 않았고(validation `+.0041`, April `+.00003`), seed가 3개라 정밀한 효과 크기로 해석하지 않습니다.
+- **Gradient-credit 성장**은 April value MSE를 평균 `-.00244` 낮췄지만 top-1은 평균 `-.0230` percentage points였습니다. validation MSE 효과는 작고 seed에 따라 달랐습니다.
+
+따라서 이전 단일 비교의 value 개선은 주로 더 높은 value learning rate로 설명할 수 있습니다. 뉴런 균형은 사용률과 정책 top-1에 일부 이점을 보였지만, gradient 성장까지 포함한 전체 조합이 균형 있게 모든 지표를 개선하지는 않았습니다.
+
+다른 출처로 일반화되는지 확인하기 위해 기준선, 높은 value LR만 적용한 모델, 전체 조합을 KGS 2018 및 Fox Pro 2019에서 추가 평가했습니다.
+
+| Holdout | 모델 | Value MSE (mean ± SD) | Policy top-1 (mean ± SD) |
+|---|---|---:|---:|
+| KGS 2018, 1,582판 / 304,466착수 | 기준선 | `.990228 ± .001941` | `1.1221 ± .0180%` |
+| KGS 2018 | Value LR만 증가 | `.978410 ± .002876` | `1.1259 ± .0143%` |
+| KGS 2018 | 전체 조합 | `.977887 ± .001680` | `1.1732 ± .1370%` |
+| Fox Pro 2019, 1,947판 / 369,858착수 | 기준선 | `.997703 ± .000872` | `.9021 ± .1150%` |
+| Fox Pro 2019 | Value LR만 증가 | `1.006032 ± .007418` | `.8963 ± .1173%` |
+| Fox Pro 2019 | 전체 조합 | `1.009393 ± .005511` | `.8992 ± .1310%` |
+
+KGS 계열에서는 value MSE가 개선됐지만, Fox에서는 높은 value LR 및 전체 조합의 MSE가 기준선보다 나빠졌습니다. 이는 한 출처의 홀드아웃 개선이 데이터 분포가 달라진 기보로 일반화되지 않을 수 있음을 보여줍니다.
+
+마지막으로 세 학습 seed의 기준선·높은 LR만·전체 조합을 각 200판씩, 총 1,800판으로 내장 heuristic과 대국했습니다. 모두 같은 16-simulation PUCT, `cpuct=1.4`, komi 6.5를 사용했고 모델 색을 번갈아 배정했습니다. 학습 seed 42 결과는 앞 절의 두 match seed 100판씩을 포함합니다.
+
+| 모델 | Seed 42 | Seed 43 | Seed 44 | 합계 W-L-D / 600 | 승점률 (95% Wilson CI) |
+|---|---:|---:|---:|---:|---:|
+| 기준선 | 79-121-0 | 173-27-0 | 102-98-0 | 354-246-0 | `59.0% (55.0–62.9%)` |
+| Value LR만 증가 | 151-49-0 | 143-57-0 | 47-153-0 | 341-259-0 | `56.8% (52.8–60.7%)` |
+| 전체 조합 | 149-51-0 | 93-107-0 | 97-103-0 | 339-261-0 | `56.5% (52.5–60.4%)` |
+
+전체 조합과 기준선의 승점률 차이는 `-2.5%p` (독립 비율 Newcombe 95% 구간 `-8.1–+3.1%p`), 높은 LR만 적용한 모델과 기준선의 차이는 `-2.2%p` (`-7.7–+3.4%p`)였습니다. 어느 변경도 이 대국에서 기준선보다 우세하다고 확인되지 않았습니다. 학습 seed별 승점률 변동도 컸고, 전체 조합은 seed 42에서 높았던 초기 파일럿 결과가 seed 43에서 재현되지 않았습니다. 내장 heuristic은 약한 상대이므로 이 결과를 외부 엔진 Elo로 해석할 수 없습니다.
+
+표의 Wilson/Newcombe 구간은 합산된 게임 결과를 독립 표본으로 간주한 근사치이며, 학습 seed 간 변동을 반영하지 않습니다. 따라서 세 seed의 개별 승점률도 함께 제시했습니다.
+
+현재 환경에서는 KataGo, GNU Go, Pachi 실행 파일을 찾지 못해 이 변경 모델의 강한 외부 엔진 대국은 수행하지 못했습니다. README의 이전 KataGo 결과는 다른 체크포인트의 과거 측정이며 이번 요인 실험의 대체 결과가 아닙니다. 외부 엔진 성능은 실행 파일·모델이 준비된 환경에서 별도로 검증해야 합니다.
+
+요인 실험 재현 예시:
+
+```bash
+for seed in 42 43 44; do
+  for balance in 0 0.2; do
+    for growth in 0 2; do
+      for value_lr in 0.00001 0.0001; do
+        model="checkpoints/go/validation-seed${seed}-balance${balance}-growth${growth}-value${value_lr}.gns"
+        cargo run --release -- go-train \
+          data/go/experiments/kgs-march-1450-seed42.csv "$model" \
+          1 "$seed" 0.1 42 128 8 16 0.55 0.2 0.01 \
+          "$growth" 0 "$balance" "$value_lr"
+      done
+    done
+  done
+done
+```
+
 ### KataGo 교사 증류 준비
 
 KGS 기보에서 게임 단위로 train/validation을 나누고, 각 게임의 여러 ply를 KataGo analysis로 평가해 방문 분포 policy와 ownership을 TSV로 만드는 스크립트를 추가했습니다. 생성된 TSV는 `보드 크기`, `komi`, `공백 구분 수순`, `action:확률` 정책 분포, `쉼표 구분 ownership` 순서입니다. 아래 명령은 적격 게임 최대 400개, 게임당 4개 위치, 128 visits를 사용합니다.
@@ -614,7 +721,7 @@ cargo run --release -- go-distill \
 
 ### 위치 기반 희소 trunk 실험
 
-`go-train`의 마지막 선택 인수 `spatial_radius`로 지역 희소 모델을 학습할 수 있습니다. 기본값 `0`은 이전 전역 연결 모델이며, 양수 `r`은 각 뉴런의 고정 anchor에서 체비쇼프 거리 `r` 안의 board feature만 입력 시냅스로 연결하고, policy/ownership 출력도 그 anchor 주변에만 연결합니다. 차례·komi 입력은 전역 입력으로 허용되고 value head는 전역 pooling을 유지합니다. 공간 모델의 뉴런은 보드에 고르게 초기 배치하고, 남은 용량은 데이터 기반 성장에 둡니다. 체크포인트 GNS5에 anchor와 반경을 저장하며 기존 GNS2–GNS4도 계속 읽습니다.
+`go-train`의 마지막 선택 인수 `spatial_radius`로 지역 희소 모델을 학습할 수 있습니다. 기본값 `0`은 이전 전역 연결 모델이며, 양수 `r`은 각 뉴런의 고정 anchor에서 체비쇼프 거리 `r` 안의 board feature만 입력 시냅스로 연결하고, policy/ownership 출력도 그 anchor 주변에만 연결합니다. 차례·komi 입력은 전역 입력으로 허용되고 value head는 전역 pooling을 유지합니다. 공간 모델의 뉴런은 보드에 고르게 초기 배치하고, 남은 용량은 데이터 기반 성장에 둡니다. 체크포인트 GNS6에는 anchor, 반경, 뉴런 사용률 설정과 통계를 저장하며 GNS2–GNS5 형식도 계속 읽습니다.
 
 ```bash
 cargo run --release -- go-train \
