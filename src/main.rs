@@ -27,9 +27,11 @@ fn usage() {
         "  go-generate <size> <games> <file> [seed=42]\n",
         "  go-import-sgf <sgf-file-or-directory> <data.csv> [skip_invalid=false]\n",
         "  go-export-sgf <data.csv> <sgf-file>\n",
-        "  go-train <data> <model> [epochs=2] [seed=42] [validation_fraction=0.1] [split_seed=42]\n",
+        "  go-train <data> <model.gns> [epochs=2] [seed=42] [validation_fraction=0.1] [split_seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [error_threshold=0.55] [novelty=0.2] [prune_strength=0.01] [growth_rule=0|1]\n",
         "  go-evaluate <model> <data.csv>\n",
         "  go-benchmark <model> [games=20] [seed=42] [komi=6.5]\n",
+        "  go-benchmark-mcts <model> <games> <seed> <komi> <simulations> [cpuct=1.4] [opponent=heuristic|random]\n",
+        "  go-benchmark-gtp-mcts <model> <engine> <games> <seed> <komi> <simulations> <cpuct> [engine-arg ...]\n",
         "  go-benchmark-gtp <model> <engine> <games> <seed> <komi> [engine-arg ...]\n",
         "  eval <checkpoint> [opponent=random|heuristic|search] [games] [seed] [depth]\n",
         "  benchmark <checkpoint> [games] [seed]\n",
@@ -40,6 +42,19 @@ fn usage() {
 }
 fn val<T: std::str::FromStr>(xs: &[String], i: usize, default: T) -> T {
     xs.get(i).and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+fn parse_optional<T: std::str::FromStr>(
+    xs: &[String],
+    i: usize,
+    name: &str,
+) -> Result<Option<T>, String> {
+    xs.get(i)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| format!("invalid {name}: {value}"))
+        })
+        .transpose()
 }
 fn opponent(name: &str, depth: u8) -> Box<dyn Agent> {
     match name {
@@ -292,11 +307,24 @@ fn run() -> Result<(), String> {
                 .transpose()?
                 .unwrap_or(0.1);
             let split_seed = val(&a, 7, 42u64);
+            let mut config = neurofour::go::GoSparseConfig::default();
+            config.max_nodes = parse_optional(&a, 8, "max_nodes")?.unwrap_or(config.max_nodes);
+            config.top_k = parse_optional(&a, 9, "top_k")?.unwrap_or(config.top_k);
+            config.max_edges_per_node =
+                parse_optional(&a, 10, "max_edges_per_node")?.unwrap_or(config.max_edges_per_node);
+            config.error_threshold =
+                parse_optional(&a, 11, "error_threshold")?.unwrap_or(config.error_threshold);
+            config.novelty_threshold =
+                parse_optional(&a, 12, "novelty_threshold")?.unwrap_or(config.novelty_threshold);
+            config.prune_strength =
+                parse_optional(&a, 13, "prune_strength")?.unwrap_or(config.prune_strength);
+            config.growth_rule =
+                parse_optional(&a, 14, "growth_rule")?.unwrap_or(config.growth_rule);
             let games = neurofour::go::load_games(data)?;
             let size = games.first().ok_or("empty Go data")?.size;
             let (training_games, validation_games) =
                 neurofour::go::split_games(&games, size, validation_fraction, split_seed)?;
-            let mut model = neurofour::go::GoModel::new(size);
+            let mut model = neurofour::go::GoSparseModel::new(size, config, seed)?;
             let t = Instant::now();
             let validation_baseline = if validation_games.is_empty() {
                 None
@@ -304,7 +332,8 @@ fn run() -> Result<(), String> {
                 Some(model.evaluate_loss(&validation_games)?.0)
             };
             let (loss, best_epoch) = if validation_games.is_empty() {
-                (model.train(&training_games, epochs, seed)?, None)
+                model.train(&training_games, epochs, seed)?;
+                (model.evaluate_loss(&training_games)?.0, None)
             } else {
                 let (best_epoch, loss, _) = model.train_with_validation(
                     &training_games,
@@ -330,30 +359,73 @@ fn run() -> Result<(), String> {
             let best_epoch = best_epoch
                 .map(|epoch| epoch.to_string())
                 .unwrap_or_else(|| "disabled".into());
-            println!("trained_go size={size} train_games={} validation_games={} epochs={epochs} best_epoch={best_epoch} train_loss={loss:.6} validation_baseline_loss={validation_baseline} validation_loss={validation_loss} validation_moves={validation_moves} time_ms={} peak_ram_kb={} file={output}",training_games.len(),validation_games.len(),t.elapsed().as_millis(),memory_kb());
+            println!("trained_go architecture=dynamic_sparse size={size} nodes={} edges={} top_k={} max_nodes={} max_edges_per_node={} error_threshold={} novelty_threshold={} prune_strength={} growth_rule={} training_symmetries=8 policy_objective=legal_softmax early_stopping=policy_value_objective train_games={} validation_games={} epochs={epochs} best_epoch={best_epoch} train_loss={loss:.6} validation_baseline_loss={validation_baseline} validation_loss={validation_loss} validation_moves={validation_moves} time_ms={} peak_ram_kb={} file={output}",model.nodes.len(),model.edge_count(),model.cfg.top_k,model.cfg.max_nodes,model.cfg.max_edges_per_node,model.cfg.error_threshold,model.cfg.novelty_threshold,model.cfg.prune_strength,model.cfg.growth_rule,training_games.len(),validation_games.len(),t.elapsed().as_millis(),memory_kb());
         }
         Some("go-evaluate") => {
-            let model = neurofour::go::GoModel::load(a.get(2).ok_or("missing Go model")?)?;
+            let model = neurofour::go::GoSparseModel::load(a.get(2).ok_or("missing Go model")?)?;
             let games = neurofour::go::load_games(a.get(3).ok_or("missing Go data")?)?;
             let matching_games = games.iter().filter(|game| game.size == model.size).count();
             let (value_mse, value_moves) = model.evaluate_loss(&games)?;
             let (policy_top1, random_top1, policy_moves) = model.evaluate_policy_top1(&games)?;
-            println!("evaluated_go size={} games={matching_games} value_mse={value_mse:.6} value_moves={value_moves} policy_top1={policy_top1:.6} random_policy_top1={random_top1:.6} policy_moves={policy_moves}",model.size);
+            println!("evaluated_go architecture=dynamic_sparse size={} nodes={} edges={} games={matching_games} value_mse={value_mse:.6} value_moves={value_moves} policy_top1={policy_top1:.6} random_policy_top1={random_top1:.6} policy_moves={policy_moves}",model.size,model.nodes.len(),model.edge_count());
         }
         Some("go-benchmark") => {
-            let model = neurofour::go::GoModel::load(a.get(2).ok_or("missing Go model")?)?;
+            let model = neurofour::go::GoSparseModel::load(a.get(2).ok_or("missing Go model")?)?;
             let games = val(&a, 3, 20usize);
             let seed = val(&a, 4, 42u64);
             let komi = val(&a, 5, 6.5f32);
             for heuristic in [false, true] {
                 let t = Instant::now();
-                let (w, l) =
-                    neurofour::go::benchmark_with_komi(&model, games, seed, heuristic, komi)?;
-                println!("go_size={} opponent={} games={games} komi={komi} W-L={w}-{l} win_rate={:.3} time_ms={} peak_ram_kb={}",model.size,if heuristic{"heuristic"}else{"random"},w as f64/games as f64,t.elapsed().as_millis(),memory_kb());
+                let (w, l) = neurofour::go::benchmark_sparse_with_komi(
+                    &model, games, seed, heuristic, komi,
+                )?;
+                println!("go_size={} architecture=dynamic_sparse opponent={} games={games} komi={komi} W-L={w}-{l} win_rate={:.3} time_ms={} peak_ram_kb={}",model.size,if heuristic{"heuristic"}else{"random"},w as f64/games as f64,t.elapsed().as_millis(),memory_kb());
             }
         }
+        Some("go-benchmark-mcts") => {
+            let model = neurofour::go::GoSparseModel::load(a.get(2).ok_or("missing Go model")?)?;
+            let games = a
+                .get(3)
+                .ok_or("missing MCTS benchmark game count")?
+                .parse::<usize>()
+                .map_err(|_| "invalid MCTS benchmark game count")?;
+            let seed = a
+                .get(4)
+                .ok_or("missing MCTS benchmark seed")?
+                .parse::<u64>()
+                .map_err(|_| "invalid MCTS benchmark seed")?;
+            let komi = a
+                .get(5)
+                .ok_or("missing MCTS benchmark komi")?
+                .parse::<f32>()
+                .map_err(|_| "invalid MCTS benchmark komi")?;
+            let simulations = a
+                .get(6)
+                .ok_or("missing MCTS simulation count")?
+                .parse::<usize>()
+                .map_err(|_| "invalid MCTS simulation count")?;
+            let cpuct = parse_optional(&a, 7, "cpuct")?.unwrap_or(1.4f32);
+            let opponent = a.get(8).map(String::as_str).unwrap_or("heuristic");
+            let heuristic = match opponent {
+                "heuristic" => true,
+                "random" => false,
+                _ => return Err("MCTS opponent must be heuristic or random".into()),
+            };
+            let t = Instant::now();
+            let results = neurofour::go::benchmark_mcts_with_komi(
+                &model,
+                games,
+                seed,
+                simulations,
+                cpuct,
+                komi,
+                heuristic,
+            )?;
+            let score = results.wins as f64 + results.draws as f64 * 0.5;
+            println!("go_mcts_benchmark architecture=dynamic_sparse board_size={} opponent={opponent} simulations={simulations} cpuct={cpuct} games={games} komi={komi} W-L-D={}-{}-{} score={:.3} model_black={}-{}-{} model_white={}-{}-{} time_ms={} peak_ram_kb={}",model.size,results.wins,results.losses,results.draws,score/games as f64,results.model_black.0,results.model_black.1,results.model_black.2,results.model_white.0,results.model_white.1,results.model_white.2,t.elapsed().as_millis(),memory_kb());
+        }
         Some("go-benchmark-gtp") => {
-            let model = neurofour::go::GoModel::load(a.get(2).ok_or("missing Go model")?)?;
+            let model = neurofour::go::GoSparseModel::load(a.get(2).ok_or("missing Go model")?)?;
             let engine = a.get(3).ok_or("missing GTP engine")?;
             let games = a
                 .get(4)
@@ -372,7 +444,48 @@ fn run() -> Result<(), String> {
                 .map_err(|_| "invalid GTP benchmark komi")?;
             let t = Instant::now();
             let results = neurofour::go::benchmark_gtp(&model, engine, &a[7..], games, seed, komi)?;
-            println!("go_gtp_benchmark board_size={} engine={engine} games={games} W-L-D={}-{}-{} score={:.3} model_black={}-{}-{} model_white={}-{}-{} time_ms={} peak_ram_kb={}",model.size,results.wins,results.losses,results.draws,(results.wins as f64 + results.draws as f64 * 0.5) / games as f64,results.model_black.0,results.model_black.1,results.model_black.2,results.model_white.0,results.model_white.1,results.model_white.2,t.elapsed().as_millis(),memory_kb());
+            println!("go_gtp_benchmark architecture=dynamic_sparse board_size={} nodes={} edges={} engine={engine} games={games} W-L-D={}-{}-{} score={:.3} model_black={}-{}-{} model_white={}-{}-{} final_score_disagreements={} time_ms={} peak_ram_kb={}",model.size,model.nodes.len(),model.edge_count(),results.wins,results.losses,results.draws,(results.wins as f64 + results.draws as f64 * 0.5) / games as f64,results.model_black.0,results.model_black.1,results.model_black.2,results.model_white.0,results.model_white.1,results.model_white.2,results.score_disagreements,t.elapsed().as_millis(),memory_kb());
+        }
+        Some("go-benchmark-gtp-mcts") => {
+            let model = neurofour::go::GoSparseModel::load(a.get(2).ok_or("missing Go model")?)?;
+            let engine = a.get(3).ok_or("missing GTP engine")?;
+            let games = a
+                .get(4)
+                .ok_or("missing GTP benchmark game count")?
+                .parse::<usize>()
+                .map_err(|_| "invalid GTP benchmark game count")?;
+            let seed = a
+                .get(5)
+                .ok_or("missing GTP benchmark seed")?
+                .parse::<u64>()
+                .map_err(|_| "invalid GTP benchmark seed")?;
+            let komi = a
+                .get(6)
+                .ok_or("missing GTP benchmark komi")?
+                .parse::<f32>()
+                .map_err(|_| "invalid GTP benchmark komi")?;
+            let simulations = a
+                .get(7)
+                .ok_or("missing MCTS simulation count")?
+                .parse::<usize>()
+                .map_err(|_| "invalid MCTS simulation count")?;
+            let cpuct = a
+                .get(8)
+                .ok_or("missing MCTS cpuct")?
+                .parse::<f32>()
+                .map_err(|_| "invalid MCTS cpuct")?;
+            let t = Instant::now();
+            let results = neurofour::go::benchmark_gtp_mcts(
+                &model,
+                engine,
+                &a[9..],
+                games,
+                seed,
+                komi,
+                simulations,
+                cpuct,
+            )?;
+            println!("go_gtp_mcts_benchmark architecture=dynamic_sparse board_size={} nodes={} edges={} engine={engine} simulations={simulations} cpuct={cpuct} games={games} W-L-D={}-{}-{} score={:.3} model_black={}-{}-{} model_white={}-{}-{} final_score_disagreements={} time_ms={} peak_ram_kb={}",model.size,model.nodes.len(),model.edge_count(),results.wins,results.losses,results.draws,(results.wins as f64 + results.draws as f64 * 0.5) / games as f64,results.model_black.0,results.model_black.1,results.model_black.2,results.model_white.0,results.model_white.1,results.model_white.2,results.score_disagreements,t.elapsed().as_millis(),memory_kb());
         }
         Some("eval") => {
             let cp = a.get(2).ok_or("missing checkpoint")?;

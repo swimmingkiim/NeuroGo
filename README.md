@@ -423,7 +423,7 @@ cargo run --release -- go-evaluate \
 
 선형 policy/value 모델은 현재 플레이어 기준 komi를 보드 면적으로 정규화한 입력 feature로 사용합니다. 예전 `NGO1` 체크포인트도 로드할 수 있으며 새 형식 `NGO2`로 저장할 때 komi 가중치는 0으로 초기화되어 기존 출력이 유지됩니다. `go-benchmark`의 선택 인자 `[komi=6.5]`로 기본값 이외의 komi도 지정할 수 있습니다.
 
-`go-train`은 기본적으로 게임 단위 90/10 train/validation 분할을 수행합니다. 분할은 마지막 인자 `split_seed`로 재현되며 같은 기보의 착수들이 두 집합으로 나뉘지 않습니다. 그 앞의 `validation_fraction`은 기본 0.1이며, `0`은 전체 데이터 학습(검증 비활성화), `0 < 비율 < 1`은 검증 활성화입니다. 검증이 켜져 있으면 epoch마다 held-out MSE를 측정하고 가장 좋은 epoch의 체크포인트를 보존합니다. 초기 validation MSE, 선택된 epoch, train/validation MSE, 평가 착수 수를 출력합니다. `go-evaluate <model> <data.csv>`는 별도 데이터셋에서 value MSE와 policy-only logits의 top-1 정확도를 평가합니다(실제 착수 선택 시 사용하는 value 보정 전 점수). policy 동점은 균등 무작위 tie-break 기대값으로 처리하며, 비교용 random top-1 기준선은 각 상태의 합법 수 수에 따른 기대 정확도입니다. 검증 지표는 기력 대국 결과를 대체하지 않습니다.
+`go-train`은 기본적으로 게임 단위 90/10 train/validation 분할을 수행합니다. 분할은 마지막 인자 `split_seed`로 재현되며 같은 기보의 착수들이 두 집합으로 나뉘지 않습니다. 그 앞의 `validation_fraction`은 기본 0.1이며, `0`은 전체 데이터 학습(검증 비활성화), `0 < 비율 < 1`은 검증 활성화입니다. sparse 모델은 validation value MSE와 legal-policy cross-entropy의 합으로 epoch을 선택하며, CLI는 value MSE를 별도로 출력합니다. `go-evaluate <model> <data.csv>`는 별도 데이터셋에서 value MSE와 합법 착수에 한정한 policy top-1 정확도를 평가합니다. policy 동점은 균등 무작위 tie-break 기대값으로 처리하며, 비교용 random top-1 기준선은 각 상태의 합법 수 수에 따른 기대 정확도입니다. 검증 지표는 기력 대국 결과를 대체하지 않습니다.
 
 학습 업데이트도 바로잡았습니다. value 예측은 게임 기록의 komi를 사용하고, `tanh` 출력 미분을 반영한 작은 SGD step을 적용합니다. 그 전에는 기본 komi로 예측하면서 입력 feature는 게임별 komi를 사용했고, 비선형 출력의 gradient도 누락되어 validation MSE가 악화됐습니다.
 
@@ -444,9 +444,182 @@ cargo run --release -- go-evaluate \
 
 19×19 데이터는 30판에서 300판으로 늘렸지만, 평가 상대별 10판은 여전히 실력 결론에 부족합니다. 특히 내장 heuristic은 포획과 중앙 선호만 사용하는 약한 상대이며 같은 계열의 self-play 데이터도 강한 기력을 보장하지 않습니다. 따라서 이 결과는 개선된 생성 속도와 19×19 규칙→데이터→학습→체크포인트→대국 경로를 확인하는 smoke benchmark입니다.
 
-### GNU Go 및 KataGo와 직접 대국
+### Go 뉴런·시냅스 모델
 
-`go-benchmark-gtp`로 색을 교대해 GTP 엔진과 대국했습니다. NeuroGo의 GTP 결과에 흑/백별 기록을 추가해 색 편향도 확인할 수 있습니다.
+현재 `go-train`, `go-evaluate`, `go-benchmark`, `go-benchmark-gtp` 명령은 Go 전용 동적 희소 뉴런·시냅스 모델을 사용합니다. top-k 희소 trunk의 입력은 차례 기준 돌 점유, bias/komi에 더해 각 교차점에 아군·상대 그룹의 1/2/3+ 활로를 나타내는 여섯 feature plane을 포함합니다. 학습은 8가지 보드 대칭을 적용하고, policy head는 합법 착수 전체에 대한 softmax cross-entropy, value head는 승패를 학습합니다. GNS3 체크포인트는 뉴런, 시냅스, 양쪽 출력 head와 성장 규칙을 저장합니다. 기존 GNS2 및 구형 feature 형식의 GNS3 파일도 읽을 수 있으며, NGO1/NGO2 선형 체크포인트는 새 Go CLI와 별도 형식입니다.
+
+실험용 `go-train` 인자는 validation split seed 뒤에 최대 뉴런 수, top-k 활성 수, 뉴런별 입력 시냅스 상한, 성장 오류 임계값, 입력 novelty 임계값, 연결 가지치기 강도, 성장 규칙을 순서대로 받습니다. 생략 시 `128, 8, 16, 0.55, 0.2, 0.01, 0`을 사용합니다. 성장 규칙 `0`은 무작위 활성 feature 선택, `1`은 현재 전체 네트워크에서 연결 수가 가장 적은 활성 입력 feature 선택입니다. `go-benchmark-mcts <model> <games> <seed> <komi> <simulations> [cpuct=1.4] [opponent=heuristic|random]`은 내장 상대와, `go-benchmark-gtp-mcts <model> <engine> <games> <seed> <komi> <simulations> <cpuct> [engine-arg ...]`은 GTP 엔진과 정책 상위 12수 제한 PUCT 대국을 실행합니다. 모델 생성/학습 seed, train/validation 분할, epoch 수가 같도록 두고 한 요인씩 바꾸는 것을 권장합니다.
+
+### 데이터 양 및 희소 구조 ablation
+
+데이터 양은 출처 혼합으로 인한 교란을 피하기 위해 KGS 2019년 3월 1,450판에서 seed 42로 300/750/1,450판을 비복원 추출했습니다. 각 설정은 같은 모델 seed 42, train 내부 90/10 게임 분할(seed 42), 기본 128/8/16 구조와 1 epoch을 사용했습니다. March 자료만 학습에 사용하고 **전혀 학습에 포함되지 않은 April KGS 1,231판**을 외부 평가로 두었습니다. 구조 실험은 1,450판에서 baseline과 한 설정씩 변경했습니다. 값은 한 seed의 탐색 결과이며 분산·유의성을 측정한 최종 ablation은 아닙니다.
+
+| 변경 요인 | 설정 (나머지는 기본) | 실제 노드/시냅스 | validation MSE | April MSE | April policy top-1 (random) |
+|---|---|---:|---:|---:|---:|
+| 데이터 300판 | 128 nodes, top-k 8, edge cap 16 | 128 / 725 | `.998934` | `.999812` | `.010413` (`.004479`) |
+| 데이터 750판 | 동일 | 128 / 688 | `.997455` | `.998904` | `.009454` (`.004479`) |
+| 데이터 1,450판 | 동일 | 128 / 657 | `.998714` | `.998659` | `.009273` (`.004479`) |
+| 데이터 1,450판, 3 epoch | 동일 | 128 / 657 | `.996384` | `.996163` | `.009935` (`.004479`) |
+| 데이터 3,397판 | March KGS 1,450 + Fox 1,947 | 128 / 677 | `.998803` | `.998723` | `.008607` (`.004479`) |
+| 노드 상한 증가 | max nodes 256 | 256 / 903 | `.998380` | `.998777` | `.011707` (`.004479`) |
+| 시냅스 상한 증가 | max edges 32 | 128 / 948 | `.997647` | `.998196` | `.009132` (`.004479`) |
+| 활성 뉴런 증가 | top-k 16 | 128 / 916 | `.997427` | `.997168` | `.011892` (`.004479`) |
+| 더 쉬운 성장 조건 | error `.25`, novelty `.05` | 128 / 830 | `.996931` | `.997508` | `.011165` (`.004479`) |
+| 더 엄격한 성장 조건 | error `.8`, novelty `.4` | 128 / 790 | `.997988` | `.998456` | `.010189` (`.004479`) |
+| 더 강한 가지치기 | prune strength `.05` | 128 / 646 | `.998646` | `.998578` | `.009200` (`.004479`) |
+
+해석: 동일 KGS 출처의 학습량을 늘려도 한 epoch에서는 지표 개선이 단조롭지 않았고, 1,450판 모델을 3 epoch 학습했을 때 MSE가 가장 일관되게 개선됐지만 여전히 1.0 근처입니다. 3,397판 혼합 학습은 1,450판보다 좋아지지 않았습니다. 단일 요인 구조 실험에서는 top-k 16이 외부 MSE와 top-1 모두 baseline보다 나았고, 256 노드나 edge cap 32 증가는 그런 개선을 보이지 않았습니다. 낮은 성장 임계값은 validation만이 아니라 외부 MSE도 조금 개선했지만 top-k 16보다 약했습니다. 효과 크기는 작고 한 seed/epoch의 결과라 결론은 “top-k와 성장 임계값을 추가 seed로 재검증할 후보” 수준입니다. 특히 데이터 증가와 구조 변화가 대국 승률을 향상시켰다는 증거는 아닙니다.
+
+대국도 별도로 확인했습니다. 기본 1 epoch 모델, 공격적 성장 모델, top-k 16 모델, 동일 데이터 3 epoch 모델 모두 각 10판씩의 내장 random 및 heuristic 대국에서 **0승 10패**였습니다. 표본이 작지만, 기보 policy top-1 개선이 실제 착수 품질로 연결되지 않는다는 점을 보여줍니다. 기본 sparse 체크포인트도 GNU Go 3.8 20판과 KataGo 32 visits/수 20판에서 각각 0승 20패였습니다(색별 0-10). 따라서 이번 실험은 검증 손실과 정책 모방 지표의 작은 차이만 찾았으며, 대국 기력 개선은 확인하지 못했습니다.
+
+실험용 재현 데이터는 `data/go/experiments/`에 seed 42의 정확한 300/750/1,450 KGS March 표본과 KGS March+Fox 합본으로 남겨 두었습니다. 예를 들어 baseline과 top-k 16을 다시 학습하고 April에서 비교할 수 있습니다.
+
+#### 성장 규칙 비교: 무작위 vs. least-connected
+
+성장 규칙을 제외한 설정을 고정하고 KGS March 1,450판, seed 42, 동일한 게임 단위 train/validation 분할, 1 epoch로 비교했습니다. `random`은 활성 입력 feature 중 하나를 무작위 선택하고, `least-connected`는 전체 뉴런에서 연결 수가 가장 적은 활성 입력 feature를 선택합니다.
+
+| 입력 시냅스 성장 규칙 | 뉴런 / 연결 수 | validation MSE | KGS April value MSE | policy top-1 (random 기준) |
+|---|---:|---:|---:|---:|
+| 무작위 (`growth_rule=0`) | 128 / 657 | `.998714` | `.998659` | `.009273` (`.004479`) |
+| least-connected (`growth_rule=1`) | 128 / 1,121 | `.999724` | `.999339` | `.010258` (`.004479`) |
+
+이번 단일 seed 실험에서 least-connected는 policy top-1이 약간 높았지만 value MSE는 더 나빴고, 연결 수는 약 71% 증가했습니다. 두 차이 모두 작아 우열이나 기력 향상의 증거로 볼 수 없습니다. 연결이 더 조밀해진 만큼 추가 seed와 자원 사용을 통제한 재검증이 필요합니다.
+
+```bash
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/kgs-march-growth-random.gns \
+  1 42 0.1 42 128 8 16 0.55 0.2 0.01 0
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/kgs-march-growth-least-connected.gns \
+  1 42 0.1 42 128 8 16 0.55 0.2 0.01 1
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-march-growth-random.gns data/go/kgs-2019-04.csv
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-march-growth-least-connected.gns data/go/kgs-2019-04.csv
+```
+
+```bash
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/kgs-march-sparse-repro.gns 1 42 0.1 42
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/kgs-march-sparse-topk16-repro.gns \
+  1 42 0.1 42 128 16 16 0.55 0.2 0.01
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-march-sparse-topk16-repro.gns \
+  data/go/kgs-2019-04.csv
+```
+
+### 희소 모델 입력·정책 개선 및 MCTS 재평가
+
+초기 무작위 성장 모델과 같은 1,450판 March 표본, seed 42, 게임 단위 90/10 분할, 128 nodes/top-k 8/edge cap 16, 1 epoch을 사용했습니다. 이번 변경은 그룹 활로 feature, 8방향 대칭 증강, 합법수 전체 softmax policy를 함께 도입했으므로 개별 기여도는 분리되지 않습니다.
+
+| 모델 | validation MSE | KGS April value MSE | policy top-1 (random 기준) | 노드 / 시냅스 |
+|---|---:|---:|---:|---:|
+| 기존 무작위 성장 기준선 | `.998714` | `.998659` | `.009273` (`.004479`) | 128 / 657 |
+| 활로+대칭+legal-softmax | `.976897` | `.987445` | `.011294` (`.004479`) | 128 / 824 |
+
+외부 April 기준 MSE가 약 `.0112` 낮아지고 top-1은 약 `.0020` 올랐습니다. 다만 MSE는 여전히 1.0 부근이고 top-1은 약 1.13%라 강한 정책을 의미하지 않습니다. 학습은 116초, peak RAM 약 27 MiB였습니다. 이전 모델은 기존 feature 일부만 사용하는 같은 크기의 sparse 체크포인트이며, 새 모델은 세 가지 변경을 함께 사용하므로 개선 원인을 특정할 수 없습니다.
+
+정책만 사용한 seed 42 모델은 seed 777, 20판에서 random과 heuristic에 각각 **0승 20패**였습니다. 소표본 의존을 줄이기 위해 기존 sparse 체크포인트와 개선 모델을 같은 16-simulation PUCT 예산으로 내장 heuristic과 각각 100판씩, 두 match seed에서 대국시켰습니다. 매 100판 세트는 모델 색을 교대해 흑/백 각 50판 진행했고, komi 6.5와 cpuct 1.4를 고정했습니다.
+
+| 체크포인트 | seed 20261031 | seed 20261101 | 합계 W-L-D | 승률 (95% Wilson CI) |
+|---|---:|---:|---:|---:|
+| 기존 sparse 기준선 | 34-66 | 46-54 | 80-120-0 / 200 | 40.0% (33.5–46.9%) |
+| 활로+대칭+legal-softmax | 81-19 | 78-22 | 159-41-0 / 200 | 79.5% (73.4–84.5%) |
+
+승률 차이는 +39.5%p이며 독립 비율에 대한 Newcombe 95% 구간은 +26.5–51.1%p입니다. 두 match seed 각각에서 개선 모델이 더 높은 승률을 보였습니다. 이 결과는 약한 내장 heuristic 상대에 한정됩니다. 뒤이은 KataGo 및 다중 학습 seed 검증은 아래에 별도로 기록합니다.
+
+```bash
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/kgs-march-sparse-enhanced.gns 1 42 0.1 42
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-march-sparse-enhanced.gns data/go/kgs-2019-04.csv
+cargo run --release -- go-benchmark-mcts \
+  checkpoints/go/kgs-march-growth-random.gns 100 20261031 6.5 16 1.4 heuristic
+cargo run --release -- go-benchmark-mcts \
+  checkpoints/go/kgs-march-sparse-enhanced.gns 100 20261031 6.5 16 1.4 heuristic
+cargo run --release -- go-benchmark-mcts \
+  checkpoints/go/kgs-march-growth-random.gns 100 20261101 6.5 16 1.4 heuristic
+cargo run --release -- go-benchmark-mcts \
+  checkpoints/go/kgs-march-sparse-enhanced.gns 100 20261101 6.5 16 1.4 heuristic
+```
+
+### 다중 학습 seed 및 KataGo 대국
+
+모델 초기화/학습 seed 42, 43, 44를 사용했습니다. 모든 모델은 같은 KGS March 1,450판, 같은 게임 단위 분할 seed 42, 1 epoch, 동일한 희소 구조와 입력·정책 개선으로 학습했습니다. 독립 KGS April 1,231판 평가는 다음과 같습니다.
+
+| 학습 seed | Validation value MSE | April value MSE | April policy top-1 |
+|---:|---:|---:|---:|
+| 42 | `.976897` | `.987445` | `.011294` |
+| 43 | `.970814` | `.982882` | `.011694` |
+| 44 | `.984817` | `.985953` | `.011771` |
+| 평균 ± 표준편차 | — | `.985427 ± .002327` | `.011586 ± .000256` |
+
+세 seed 모두 April value MSE가 무예측 기준 1.0보다 낮고 policy top-1은 합법수 균등 기준 `.004479`보다 높았습니다. 다만 세 seed만으로 일반화 성능의 안정성을 확정할 수는 없습니다.
+
+세 모델을 [KataGo v1.18.1 CPU, 공개 b6c64 네트워크](https://github.com/lightvector/KataGo/releases/tag/v1.18.1)와 각각 20판 대국시켰습니다. 흑/백 색은 각 10판씩 교대했고, komi 7.5·Chinese rules·KataGo 32 visits/수·1 thread를 고정했습니다. NeuroGo는 매 수 상위 12수 PUCT, 16 simulations, `cpuct=1.4`를 사용했습니다. 종료 승패는 로컬 점수가 아니라 KataGo GTP `final_score`로 판정했습니다.
+
+| 학습 seed | NeuroGo W-L-D | 흑 W-L-D | 백 W-L-D | 로컬 점수와 `final_score` 불일치 |
+|---:|---:|---:|---:|---:|
+| 42 | 0-20-0 | 0-10-0 | 0-10-0 | 13/20 |
+| 43 | 0-20-0 | 0-10-0 | 0-10-0 | 8/20 |
+| 44 | 0-20-0 | 0-10-0 | 0-10-0 | 12/20 |
+| 합계 | 0-60-0 | 0-30-0 | 0-30-0 | 33/60 |
+
+KataGo 상대 60판에서 승리는 없었습니다(0/60, 정확 이항 단측 95% 상한 약 4.9%). 따라서 개선된 기보 지표와 heuristic 상대 성적은 KataGo급 대국 기력으로 이어지지 않았습니다. 세 학습 seed 간 차이도 이 엔진 설정에서 관찰되지 않았지만, 승률 0%는 모델의 강도 서열을 비교하기에 바닥 효과가 있어 학습 seed 우열을 결론내릴 수 없습니다. 또한 NeuroGo 16 simulations와 KataGo 32 visits는 계산량이 같지 않으므로 Elo 비교가 아닙니다. KataGo의 로컬 점수와 GTP 판정은 60판 중 33판에서 달라져, 승패 통계에는 GTP 결과만 사용했습니다.
+
+재현 예시(seed 42; seed 43/44는 체크포인트 이름과 실행 seed를 바꿉니다):
+
+```bash
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/kgs-march-sparse-enhanced-seed43.gns 1 43 0.1 42
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/kgs-march-sparse-enhanced-seed44.gns 1 44 0.1 42
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-march-sparse-enhanced-seed43.gns data/go/kgs-2019-04.csv
+cargo run --release -- go-benchmark-gtp-mcts \
+  checkpoints/go/kgs-march-sparse-enhanced-seed43.gns /path/to/katago \
+  20 43043 7.5 16 1.4 gtp -model /path/to/b6c64.txt.gz \
+  -config /path/to/default_gtp.cfg \
+  -override-config maxVisits=32,numSearchThreads=1,rules=chinese,ponderingEnabled=false
+```
+
+```bash
+cargo run --release -- go-train \
+  data/go/kgs-2019-03-04.csv checkpoints/go/kgs-2019-sparse.gns \
+  1 42 0.1 42
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-2019-sparse.gns data/go/kgs-2018-04.csv
+cargo run --release -- go-benchmark \
+  checkpoints/go/kgs-2019-sparse.gns 20 777 7.5
+cargo run --release -- go-benchmark-gtp \
+  checkpoints/go/kgs-2019-sparse.gns /path/to/katago 50 42 7.5 \
+  gtp -model /path/to/b6c64.txt.gz -config /path/to/default_gtp.cfg \
+  -override-config maxVisits=32,numSearchThreads=1,rules=chinese,ponderingEnabled=false
+```
+
+이하의 기존 구조 ablation 및 첫 sparse 재학습 결과는 활로 feature·대칭 증강·합법수 전체 softmax·MCTS를 추가하기 전 초기 모델을 대상으로 한 과거 기준선입니다. 현재 모델은 그룹 활로 feature와 정책 유도 MCTS를 갖지만, 지역 연결 기반 trunk, ownership/score 보조 head, self-play 강화학습은 아직 없습니다. 따라서 아래 예전 결과를 새 학습 모델의 수치와 혼합해 해석하지 않습니다.
+
+첫 19×19 재학습은 KGS 2019 2,681판을 게임 단위 2,413/268 train/validation으로 나눠 seed 42, 최대 3 epoch 수행했습니다. epoch 3이 선택됐고, 128개 뉴런·739개 입력 시냅스(top-k 8)로 validation value MSE `.985466`을 기록했습니다(초기 무예측 기준 1.000000, 학습+검증 선택 약 65.8초, peak RAM 약 14.6 MiB). value는 개선됐지만 차이는 작습니다.
+
+| 별도 평가 데이터 | 판수/착수 | 이전 선형 MSE / top-1 | 새 sparse MSE / top-1 | 합법수 균등 기준 |
+|---|---:|---:|---:|---:|
+| KGS 2019년 4월 | 1,231 / 232,601 | `.982330` / `.007833` | `.990831` / `.012158` | `.004479` |
+| KGS 2018년 4월 | 1,582 / 304,466 | `.974296` / `.008993` | `.990982` / `.011279` | `.004392` |
+| Fox 프로 기보 | 1,947 / 369,858 | `1.064625` / `.003983` | `.999215` / `.007998` | `.004142` |
+
+학습 설정/epoch이 완전히 통제된 architecture ablation은 아니므로 직접 우열로 단정할 수 없습니다. 새 모델은 세 테스트 모두 policy top-1이 높았지만, value MSE는 Fox에서 좋아지고 KGS 테스트 두 곳에서는 이전 선형 모델보다 나빠졌습니다. MSE는 대체로 무예측 기준 1.0에 가깝고, policy top-1도 정책 모방 지표이지 승률·기력 지표가 아닙니다.
+
+### 이전 선형 모델의 GNU Go 및 KataGo 대국 (과거 결과)
+
+아래는 NGO 선형 모델로 실행한 과거 대국이며 새 GNS sparse 모델 결과가 아닙니다. 결과는 색을 교대해 집계했습니다.
 
 | 상대 | 보드 및 NeuroGo 체크포인트 | 판수 | NeuroGo W-L-D | 설정 |
 |---|---|---:|---:|---|
@@ -454,15 +627,26 @@ cargo run --release -- go-evaluate \
 | GNU Go 3.8 | 19×19, `kgs-2019-04.ngo` | 20 | 0-20-0 | Chinese rules, level 0 |
 | KataGo v1.18.1 | 19×19, `kgs-2019-04.ngo` | 50 | 25-25-0 | 소형 b6c64 네트워크, 32 visits/수, 검색 스레드 1개, komi 7.5, Chinese rules |
 
-KataGo 대국의 색별 결과는 NeuroGo가 흑일 때 0승 25패, 백일 때 25승 0패였습니다. 전체 50% 결과는 실력 동등을 뜻하지 않으며, 25판씩의 색별 표본만으로 결론을 내릴 수도 없습니다. KataGo에는 매 수 32 visits의 검색을 허용한 반면 NeuroGo는 선형 policy/value 한 번으로 착수를 정하므로 계산 예산도 대칭이 아닙니다. 이 결과는 강도나 Elo 측정이 아닌 저예산 실행 가능성 및 색별 성능을 확인한 예비 대국입니다. GNU Go도 level 0 설정의 기준선이며, 위 판수는 통계적으로 유의한 실력 평가에 부족합니다.
+KataGo 대국의 색별 결과는 NeuroGo가 흑일 때 0승 25패, 백일 때 25승 0패였으나, 당시 승패를 NeuroGo의 로컬 영역 점수로만 판정했습니다. 이후 새 sparse 모델 10판의 KataGo `final_score`와 로컬 판정을 비교했을 때 6판이 달랐습니다. 따라서 과거의 25-25 결과는 결과 판정 오류 가능성 때문에 유효한 성능 지표로 취급하지 않습니다. 대국당 32 visits와 선형/동적 sparse 모델 사이의 계산 예산도 통제되지 않았습니다.
 
 재현에는 [KataGo v1.18.1 CPU release](https://github.com/lightvector/KataGo/releases/tag/v1.18.1)와 [공개 b6c64 네트워크](https://media.katagotraining.org/uploaded/networks/models_extra/lionffen_b6c64_3x3_v10.txt.gz)가 필요합니다. 네트워크는 19×19용 저연산 모델이며 최신 대형 KataGo 네트워크의 대표 결과가 아닙니다.
 
+### 초기 sparse 모델의 KataGo/GNU Go 대국 (과거 결과)
+
+아래는 활로 feature·대칭 증강·전체 합법수 policy·MCTS 도입 전의 초기 GNS2 계열 sparse 체크포인트 결과이며, 이 문서 앞의 최신 다중 seed PUCT 대국과 별도 실험입니다. 당시 직접 policy 모델은 KataGo 32 visits/수, 검색 스레드 1개, komi 7.5, Chinese rules, seed 42의 색 교대 20판에서 0승 20패였습니다. 로컬 영역 점수 판정은 20판 중 11판에서 KataGo의 `final_score`와 달라 최종 승패는 외부 엔진 점수로 교체했습니다. 앞선 8 visits 10판 smoke 대국도 0승 10패였고 점수 판정은 6/10에서 달랐습니다.
+
+| 상대 | 보드 | 판수 | NeuroGo W-L-D | 흑 모델 W-L-D | 백 모델 W-L-D | final_score 불일치 | 시간 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GNU Go 3.8, Chinese level 0 | 19×19 | 20 | 0-20-0 | 0-10-0 | 0-10-0 | 0/20 | 300초 |
+| KataGo v1.18.1, 32 visits/수·1 thread | 19×19 | 20 | 0-20-0 | 0-10-0 | 0-10-0 | 11/20 | 492초 |
+
+동일 komi 7.5와 색 교대 조건에서 양쪽 엔진 모두 20판을 전부 이겼습니다. 이는 과거 모델의 소표본 결과이며 NeuroGo에는 탐색이 없고 KataGo에는 매 수 32 visits가 있어 계산 예산이 통제된 Elo/기력 비교가 아닙니다. GNU Go 대국의 로컬 점수와 엔진 판정은 일치했지만, KataGo 대국의 로컬 점수 함수는 사석 판정이 없어 다수 게임에서 어긋났습니다. Linux에서 출력된 NeuroGo 프로세스의 peak RAM은 각각 약 3.5 MiB·3.7 MiB이며, 별도 엔진 프로세스 메모리는 포함하지 않습니다.
+
 ```bash
 cargo run --release -- go-benchmark-gtp \
-  checkpoints/go/kgs-2019-04.ngo /path/to/katago 50 42 7.5 \
+  checkpoints/go/kgs-2019-sparse.gns /path/to/katago 20 42 7.5 \
   gtp -model /path/to/b6c64.txt.gz -config /path/to/default_gtp.cfg \
-  -override-config maxVisits=32,numSearchThreads=1,rules=chinese,ponderingEnabled=false
+  -override-config maxVisits=32,numSearchThreads=1,rules=chinese,ponderingEnabled=false,logAllGTPCommunication=false
 ```
 
-현재 Go 모델은 완성된 동적 희소 모델이 아니라 비교용 선형 하한선입니다. SGF 입출력과 KGS 2018·2019 공개 기보 학습, 게임 단위 validation 및 best-epoch 보존, 별도 기간 데이터셋 value/policy 평가를 연결했습니다. 독립 기간 평가는 가능해졌지만 동일 KGS 출처이며 중복 기보 탐지를 하지 않았으므로 다른 출처의 중복 없는 테스트셋이 여전히 필요합니다. 다음 단계로 ownership·score·활로 보조 head, 지역 연결을 가진 동적 희소 trunk, policy 상위 수를 확장하는 제한 MCTS, 색별 결과와 다중 seed를 포함한 GNU Go/Pachi/KataGo 고정 예산 대국을 확장하고 최소 수천 판으로 평가해야 합니다. 현재 직접 대국은 이와 같은 실력 비교를 대신하지 않습니다.
+현재 Go 경로는 동적 희소 뉴런·시냅스, 그룹 활로 입력, 대칭 증강, 합법수 전체 policy 학습과 제한 MCTS를 사용합니다. 그러나 제한 MCTS 대국 결과는 약한 내장 heuristic 상대와의 소표본이며 KataGo급 기력의 증거가 아닙니다. KGS/Fox 중복 검사도 불완전합니다. 더 넓은 기보, 다중 seed와 충분한 판수, 고정된 계산 예산의 외부 엔진 대국이 필요합니다.

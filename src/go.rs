@@ -384,6 +384,25 @@ impl GoBoard {
         let mut features = self.features();
         let turn_komi = if self.turn == 1 { -komi } else { komi };
         features.push(turn_komi / self.cells.len() as f32);
+        let (group_at, liberties, _) = self.group_liberties();
+        let points = self.cells.len();
+        let tactical_start = points * 2 + 2;
+        features.resize(tactical_start + points * 6, 0.0);
+        for (point, &color) in self.cells.iter().enumerate() {
+            if color == 0 {
+                continue;
+            }
+            let relative_color = if color == self.turn { 0 } else { 3 };
+            let count = liberties[group_at[point]];
+            let bucket = if count == 1 {
+                0
+            } else if count == 2 {
+                1
+            } else {
+                2
+            };
+            features[tactical_start + (relative_color + bucket) * points + point] = 1.0;
+        }
         features
     }
 }
@@ -411,6 +430,50 @@ impl GoGame {
         }
         Ok(komi)
     }
+}
+
+fn transform_point(point: usize, size: usize, symmetry: usize) -> usize {
+    let (mut row, mut col) = (point / size, point % size);
+    if symmetry >= 4 {
+        col = size - 1 - col;
+    }
+    for _ in 0..(symmetry % 4) {
+        (row, col) = (col, size - 1 - row);
+    }
+    row * size + col
+}
+
+fn augment_game_symmetries(game: &GoGame) -> Vec<GoGame> {
+    (0..8)
+        .map(|symmetry| GoGame {
+            size: game.size,
+            moves: game
+                .moves
+                .iter()
+                .map(|&point| {
+                    if point == game.size * game.size {
+                        point
+                    } else {
+                        transform_point(point, game.size, symmetry)
+                    }
+                })
+                .collect(),
+            winner: game.winner,
+            result: game.result.clone(),
+            komi: game.komi.clone(),
+            first_turn: game.first_turn,
+            black_setup: game
+                .black_setup
+                .iter()
+                .map(|&point| transform_point(point, game.size, symmetry))
+                .collect(),
+            white_setup: game
+                .white_setup
+                .iter()
+                .map(|&point| transform_point(point, game.size, symmetry))
+                .collect(),
+        })
+        .collect()
 }
 pub fn generate(path: &str, size: usize, games: usize, seed: u64) -> Result<(), String> {
     let mut rng = Rng::new(seed);
@@ -1134,6 +1197,1014 @@ fn serialize_points(points: &[usize]) -> String {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct GoSparseEdge {
+    pub input: u16,
+    pub weight: f32,
+    pub strength: f32,
+    pub last_active: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct GoSparseNode {
+    pub bias: f32,
+    pub utility: f32,
+    pub dormant: bool,
+    pub edges: Vec<GoSparseEdge>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GoSparseConfig {
+    pub max_nodes: usize,
+    pub max_edges_per_node: usize,
+    pub top_k: usize,
+    pub learning_rate: f32,
+    pub value_learning_rate: f32,
+    pub policy_learning_rate: f32,
+    pub novelty_threshold: f32,
+    pub error_threshold: f32,
+    pub prune_strength: f32,
+    pub dormancy_steps: u64,
+    pub growth_rule: u8,
+}
+
+impl Default for GoSparseConfig {
+    fn default() -> Self {
+        Self {
+            max_nodes: 128,
+            max_edges_per_node: 16,
+            top_k: 8,
+            learning_rate: 0.0001,
+            value_learning_rate: 0.00001,
+            policy_learning_rate: 0.002,
+            novelty_threshold: 0.2,
+            error_threshold: 0.55,
+            prune_strength: 0.01,
+            dormancy_steps: 20_000,
+            growth_rule: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GoSparseModel {
+    pub size: usize,
+    pub cfg: GoSparseConfig,
+    pub nodes: Vec<GoSparseNode>,
+    pub value_weights: Vec<f32>,
+    pub policy_weights: Vec<f32>,
+    pub step: u64,
+}
+
+struct GoSearchEdge {
+    node: usize,
+    action: usize,
+    prior: f32,
+}
+
+struct GoSearchNode {
+    board: GoBoard,
+    children: Vec<GoSearchEdge>,
+    visits: usize,
+    value_sum: f32,
+    expanded: bool,
+}
+
+#[derive(Default)]
+pub struct GoMctsBenchmarkResults {
+    pub wins: usize,
+    pub losses: usize,
+    pub draws: usize,
+    pub model_black: (usize, usize, usize),
+    pub model_white: (usize, usize, usize),
+}
+
+impl GoMctsBenchmarkResults {
+    fn record(&mut self, model_black: bool, result: Option<bool>) {
+        let color = if model_black {
+            &mut self.model_black
+        } else {
+            &mut self.model_white
+        };
+        match result {
+            Some(true) => {
+                self.wins += 1;
+                color.0 += 1;
+            }
+            Some(false) => {
+                self.losses += 1;
+                color.1 += 1;
+            }
+            None => {
+                self.draws += 1;
+                color.2 += 1;
+            }
+        }
+    }
+}
+
+impl GoSparseModel {
+    pub fn new(size: usize, cfg: GoSparseConfig, seed: u64) -> Result<Self, String> {
+        GoBoard::new(size)?;
+        if cfg.max_nodes == 0
+            || cfg.top_k == 0
+            || cfg.max_edges_per_node == 0
+            || cfg.top_k > cfg.max_nodes
+            || !cfg.learning_rate.is_finite()
+            || !cfg.value_learning_rate.is_finite()
+            || !cfg.policy_learning_rate.is_finite()
+            || cfg.learning_rate <= 0.0
+            || cfg.value_learning_rate <= 0.0
+            || cfg.policy_learning_rate <= 0.0
+            || !cfg.novelty_threshold.is_finite()
+            || !(0.0..=1.0).contains(&cfg.novelty_threshold)
+            || !cfg.error_threshold.is_finite()
+            || cfg.error_threshold < 0.0
+            || !cfg.prune_strength.is_finite()
+            || cfg.prune_strength < 0.0
+            || cfg.growth_rule > 1
+        {
+            return Err("invalid Go sparse model configuration".into());
+        }
+        let mut rng = Rng::new(seed);
+        let points = size * size;
+        let mut inputs: Vec<_> = (0..points * 2).collect();
+        rng.shuffle(&mut inputs);
+        let nodes = inputs
+            .into_iter()
+            .take(cfg.top_k)
+            .map(|input| GoSparseNode {
+                bias: 0.0,
+                utility: 0.1,
+                dormant: false,
+                edges: vec![
+                    GoSparseEdge {
+                        input: (points * 2) as u16,
+                        weight: rng.f32() * 0.2 - 0.1,
+                        strength: 0.1,
+                        last_active: 0,
+                    },
+                    GoSparseEdge {
+                        input: input as u16,
+                        weight: rng.f32() * 0.2 - 0.1,
+                        strength: 0.1,
+                        last_active: 0,
+                    },
+                ],
+            })
+            .collect();
+        Ok(Self {
+            size,
+            value_weights: vec![0.0; cfg.max_nodes],
+            policy_weights: vec![0.0; (size * size + 1) * cfg.max_nodes],
+            cfg,
+            nodes,
+            step: 0,
+        })
+    }
+
+    fn activations(&self, board: &GoBoard, komi: f32) -> Vec<(usize, f32, f32)> {
+        let features = board.features_with_komi(komi);
+        self.activations_from_features(&features)
+    }
+
+    fn activations_from_features(&self, features: &[f32]) -> Vec<(usize, f32, f32)> {
+        let mut active: Vec<_> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| !node.dormant)
+            .map(|(index, node)| {
+                let sum = node.bias
+                    + node
+                        .edges
+                        .iter()
+                        .map(|edge| edge.weight * features[edge.input as usize])
+                        .sum::<f32>();
+                (index, sum.tanh())
+            })
+            .collect();
+        active.sort_by(|left, right| {
+            right
+                .1
+                .abs()
+                .total_cmp(&left.1.abs())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        active.truncate(self.cfg.top_k);
+        active
+            .into_iter()
+            .map(|(index, activation)| {
+                let derivative = 1.0 - activation * activation;
+                (index, activation, derivative)
+            })
+            .collect()
+    }
+
+    fn value_from_activations(&self, active: &[(usize, f32, f32)]) -> f32 {
+        active
+            .iter()
+            .map(|(index, activation, _)| self.value_weights[*index] * activation)
+            .sum::<f32>()
+            .tanh()
+    }
+
+    fn policy_from_activations(&self, action: usize, active: &[(usize, f32, f32)]) -> f32 {
+        let start = action * self.cfg.max_nodes;
+        active
+            .iter()
+            .map(|(index, activation, _)| self.policy_weights[start + index] * activation)
+            .sum()
+    }
+
+    fn policy_probabilities(&self, legal: &[usize], active: &[(usize, f32, f32)]) -> Vec<f32> {
+        let logits: Vec<_> = legal
+            .iter()
+            .map(|&action| self.policy_from_activations(action, active))
+            .collect();
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut probabilities: Vec<_> = logits
+            .iter()
+            .map(|logit| (*logit - max_logit).exp())
+            .collect();
+        let normalizer = probabilities.iter().sum::<f32>();
+        for probability in &mut probabilities {
+            *probability /= normalizer;
+        }
+        probabilities
+    }
+
+    fn select_growth_input(&self, candidates: &[usize], rng: &mut Rng) -> usize {
+        if self.cfg.growth_rule == 0 {
+            return candidates[rng.usize(candidates.len())];
+        }
+        let input_count = self.size * self.size * 8 + 2;
+        let mut connection_counts = vec![0usize; input_count];
+        for node in &self.nodes {
+            for edge in &node.edges {
+                connection_counts[edge.input as usize] += 1;
+            }
+        }
+        let min_count = candidates
+            .iter()
+            .map(|&input| connection_counts[input])
+            .min()
+            .unwrap_or(0);
+        let least_connected: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|&input| connection_counts[input] == min_count)
+            .collect();
+        least_connected[rng.usize(least_connected.len())]
+    }
+
+    pub fn value_with_komi(&self, board: &GoBoard, komi: f32) -> f32 {
+        self.value_from_activations(&self.activations(board, komi))
+    }
+
+    pub fn value(&self, board: &GoBoard) -> f32 {
+        self.value_with_komi(board, 6.5)
+    }
+
+    pub fn choose_with_komi(&self, board: &GoBoard, rng: &mut Rng, komi: f32) -> usize {
+        let active = self.activations(board, komi);
+        let mut scored = Vec::new();
+        for action in board.legal_moves() {
+            scored.push((
+                self.policy_from_activations(action, &active),
+                rng.next_u64(),
+                action,
+            ));
+        }
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| right.1.cmp(&left.1))
+        });
+        scored
+            .first()
+            .map(|(_, _, action)| *action)
+            .unwrap_or(board.pass_action())
+    }
+
+    fn expand_search_node(
+        &self,
+        tree: &mut Vec<GoSearchNode>,
+        node_index: usize,
+        komi: f32,
+    ) -> Result<f32, String> {
+        let board = tree[node_index].board.clone();
+        if board.terminal() {
+            tree[node_index].expanded = true;
+            let score = board.score_black(komi);
+            return Ok(if score == 0.0 {
+                0.0
+            } else if score.signum() as i8 == board.turn {
+                1.0
+            } else {
+                -1.0
+            });
+        }
+        let legal = board.legal_moves();
+        let features = board.features_with_komi(komi);
+        let active = self.activations_from_features(&features);
+        let probabilities = self.policy_probabilities(&legal, &active);
+        let mut candidates: Vec<_> = legal.into_iter().zip(probabilities).collect();
+        candidates.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        candidates.truncate(12);
+        let prior_sum = candidates.iter().map(|candidate| candidate.1).sum::<f32>();
+        let mut children = Vec::with_capacity(candidates.len());
+        for (action, prior) in candidates {
+            let mut child_board = board.clone();
+            child_board.play(action)?;
+            let child_index = tree.len();
+            tree.push(GoSearchNode {
+                board: child_board,
+                children: Vec::new(),
+                visits: 0,
+                value_sum: 0.0,
+                expanded: false,
+            });
+            children.push(GoSearchEdge {
+                node: child_index,
+                action,
+                prior: prior / prior_sum,
+            });
+        }
+        tree[node_index].children = children;
+        tree[node_index].expanded = true;
+        Ok(self.value_from_activations(&active))
+    }
+
+    pub fn choose_mcts_with_komi(
+        &self,
+        board: &GoBoard,
+        simulations: usize,
+        cpuct: f32,
+        komi: f32,
+    ) -> Result<usize, String> {
+        if board.size != self.size
+            || simulations == 0
+            || !cpuct.is_finite()
+            || cpuct <= 0.0
+            || !komi.is_finite()
+        {
+            return Err("invalid Go MCTS settings or board".into());
+        }
+        let mut tree = vec![GoSearchNode {
+            board: board.clone(),
+            children: Vec::new(),
+            visits: 0,
+            value_sum: 0.0,
+            expanded: false,
+        }];
+        self.expand_search_node(&mut tree, 0, komi)?;
+        for _ in 0..simulations {
+            let mut path = vec![0usize];
+            let mut node_index = 0usize;
+            let leaf_value = loop {
+                if tree[node_index].children.is_empty() {
+                    break if tree[node_index].expanded {
+                        let score = tree[node_index].board.score_black(komi);
+                        if score == 0.0 {
+                            0.0
+                        } else if score.signum() as i8 == tree[node_index].board.turn {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                    } else {
+                        self.expand_search_node(&mut tree, node_index, komi)?
+                    };
+                }
+                let parent_visits = tree[node_index].visits as f32;
+                let edge_index = tree[node_index]
+                    .children
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, left), (_, right)| {
+                        let left_child = &tree[left.node];
+                        let right_child = &tree[right.node];
+                        let left_score = -left_child.value_sum / left_child.visits.max(1) as f32
+                            + cpuct * left.prior * (parent_visits.sqrt() + 1.0)
+                                / (left_child.visits as f32 + 1.0);
+                        let right_score = -right_child.value_sum / right_child.visits.max(1) as f32
+                            + cpuct * right.prior * (parent_visits.sqrt() + 1.0)
+                                / (right_child.visits as f32 + 1.0);
+                        left_score.total_cmp(&right_score)
+                    })
+                    .map(|(index, _)| index)
+                    .ok_or("Go MCTS node has no selectable child")?;
+                node_index = tree[node_index].children[edge_index].node;
+                path.push(node_index);
+                if !tree[node_index].expanded {
+                    break self.expand_search_node(&mut tree, node_index, komi)?;
+                }
+            };
+            let mut value = leaf_value;
+            for visited in path.into_iter().rev() {
+                tree[visited].visits += 1;
+                tree[visited].value_sum += value;
+                value = -value;
+            }
+        }
+        tree[0]
+            .children
+            .iter()
+            .max_by_key(|edge| tree[edge.node].visits)
+            .map(|edge| edge.action)
+            .ok_or_else(|| "Go MCTS failed to select a move".into())
+    }
+
+    fn train_position(
+        &mut self,
+        board: &GoBoard,
+        komi: f32,
+        action: usize,
+        value_target: f32,
+        rng: &mut Rng,
+    ) -> Result<f32, String> {
+        let features = board.features_with_komi(komi);
+        let active = self.activations_from_features(&features);
+        if active.is_empty() {
+            return Err("Go sparse model has no active neurons".into());
+        }
+        let legal = board.legal_moves();
+        if !legal.contains(&action) {
+            return Err("Go training move is not legal".into());
+        }
+        let probabilities = self.policy_probabilities(&legal, &active);
+        let target_index = legal
+            .iter()
+            .position(|&candidate| candidate == action)
+            .ok_or("Go training move is not legal")?;
+        let policy_loss = -probabilities[target_index].max(f32::MIN_POSITIVE).ln();
+        let prediction = self.value_from_activations(&active);
+        let value_error = value_target - prediction;
+        let value_delta = value_error * (1.0 - prediction * prediction);
+        let policy_learning_rate = self.cfg.policy_learning_rate;
+        let learning_rate = self.cfg.learning_rate;
+        let value_learning_rate = self.cfg.value_learning_rate;
+        let mut policy_directions = Vec::with_capacity(legal.len());
+        for (index, &candidate) in legal.iter().enumerate() {
+            let target = f32::from(index == target_index);
+            policy_directions.push((candidate, target - probabilities[index]));
+        }
+        let mut hidden_deltas = Vec::with_capacity(active.len());
+        for &(index, activation, derivative) in &active {
+            let value_weight = self.value_weights[index];
+            let policy_delta = policy_directions
+                .iter()
+                .map(|(candidate, direction)| {
+                    direction * self.policy_weights[candidate * self.cfg.max_nodes + index]
+                })
+                .sum::<f32>();
+            hidden_deltas.push((
+                index,
+                activation,
+                derivative,
+                value_learning_rate * value_delta * value_weight
+                    + policy_learning_rate * policy_delta,
+            ));
+        }
+        for &(index, activation, _) in &active {
+            self.value_weights[index] += value_learning_rate * value_delta * activation;
+            for &(candidate, direction) in &policy_directions {
+                self.policy_weights[candidate * self.cfg.max_nodes + index] +=
+                    policy_learning_rate * direction * activation;
+            }
+        }
+        self.step += 1;
+        let active_inputs: Vec<_> = features
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &value)| (value != 0.0).then_some(index))
+            .collect();
+        for (index, activation, derivative, hidden_delta) in hidden_deltas {
+            let model_error = value_error.abs().max(1.0 - probabilities[target_index]);
+            let new_input = if model_error > self.cfg.error_threshold
+                && self.nodes[index].edges.len() < self.cfg.max_edges_per_node
+            {
+                let missing: Vec<_> = active_inputs
+                    .iter()
+                    .copied()
+                    .filter(|input| {
+                        !self.nodes[index]
+                            .edges
+                            .iter()
+                            .any(|edge| edge.input as usize == *input)
+                    })
+                    .collect();
+                if missing.is_empty() {
+                    None
+                } else {
+                    Some(self.select_growth_input(&missing, rng))
+                }
+            } else {
+                None
+            };
+            let node = &mut self.nodes[index];
+            let gradient = hidden_delta * derivative;
+            node.bias += learning_rate * gradient;
+            node.utility = node.utility * 0.995
+                + (value_error.abs() * activation.abs()
+                    + (1.0 - probabilities[target_index]) * activation.abs())
+                    * 0.005;
+            for edge in &mut node.edges {
+                let input = features[edge.input as usize];
+                if input != 0.0 {
+                    edge.weight += learning_rate * gradient * input;
+                    edge.strength = edge.strength * 0.99 + (gradient * input).abs() * 0.01;
+                    edge.last_active = self.step;
+                }
+            }
+            if let Some(input) = new_input {
+                node.edges.push(GoSparseEdge {
+                    input: input as u16,
+                    weight: (rng.f32() * 0.1 - 0.05) + model_error.signum() * 0.01,
+                    strength: model_error * activation.abs().max(0.1),
+                    last_active: self.step,
+                });
+            }
+        }
+        let model_error = value_error.abs().max(1.0 - probabilities[target_index]);
+        let can_grow =
+            self.nodes.len() < self.cfg.max_nodes || self.nodes.iter().any(|node| node.dormant);
+        if model_error > self.cfg.error_threshold && can_grow {
+            let mut represented = vec![false; features.len()];
+            for node in &self.nodes {
+                for edge in &node.edges {
+                    represented[edge.input as usize] = true;
+                }
+            }
+            let covered = active_inputs
+                .iter()
+                .filter(|&&input| represented[input])
+                .count();
+            let novelty = 1.0 - covered as f32 / active_inputs.len().max(1) as f32;
+            if novelty <= self.cfg.novelty_threshold {
+                if self.step % 4096 == 0 {
+                    self.maintain();
+                }
+                return Ok(value_error * value_error + policy_loss);
+            }
+            let input = self.select_growth_input(&active_inputs, rng);
+            let new_node = GoSparseNode {
+                bias: 0.0,
+                utility: model_error * 0.1,
+                dormant: false,
+                edges: vec![GoSparseEdge {
+                    input: input as u16,
+                    weight: rng.f32() * 0.1 - 0.05,
+                    strength: model_error * 0.1,
+                    last_active: self.step,
+                }],
+            };
+            if self.nodes.len() < self.cfg.max_nodes {
+                self.nodes.push(new_node);
+            } else if let Some(index) = self.nodes.iter().position(|node| node.dormant) {
+                self.nodes[index] = new_node;
+                self.value_weights[index] = 0.0;
+                for action in 0..=self.size * self.size {
+                    self.policy_weights[action * self.cfg.max_nodes + index] = 0.0;
+                }
+            }
+        }
+        if self.step % 4096 == 0 {
+            self.maintain();
+        }
+        Ok(value_error * value_error + policy_loss)
+    }
+
+    fn maintain(&mut self) {
+        for node in &mut self.nodes {
+            node.edges.retain(|edge| {
+                edge.strength >= self.cfg.prune_strength
+                    || self.step.saturating_sub(edge.last_active) < self.cfg.dormancy_steps
+            });
+            node.dormant = node.edges.is_empty() || node.utility < 0.0001;
+        }
+    }
+
+    pub fn train(&mut self, games: &[GoGame], epochs: usize, seed: u64) -> Result<f32, String> {
+        let mut rng = Rng::new(seed);
+        for game in games.iter().filter(|game| game.size == self.size) {
+            validate_game(game)?;
+            game.komi_value()?;
+        }
+        let augmented_games: Vec<_> = games
+            .iter()
+            .filter(|game| game.size == self.size)
+            .flat_map(augment_game_symmetries)
+            .collect();
+        let mut loss = 0.0;
+        for _ in 0..epochs {
+            let mut order: Vec<_> = (0..augmented_games.len()).collect();
+            rng.shuffle(&mut order);
+            let mut total = 0.0;
+            let mut positions = 0usize;
+            for game_index in order {
+                let game = &augmented_games[game_index];
+                let komi = game.komi_value()?;
+                let mut board = GoBoard::with_setup(
+                    self.size,
+                    &game.black_setup,
+                    &game.white_setup,
+                    game.first_turn,
+                )?;
+                for &action in &game.moves {
+                    let target = match game.winner {
+                        0 => 0.0,
+                        winner if winner == board.turn => 1.0,
+                        _ => -1.0,
+                    };
+                    total += self.train_position(&board, komi, action, target, &mut rng)?;
+                    positions += 1;
+                    board.play(action)?;
+                }
+            }
+            if positions == 0 {
+                return Err("Go training set contains no moves for this board size".into());
+            }
+            loss = total / positions as f32;
+        }
+        Ok(loss)
+    }
+
+    pub fn evaluate_loss(&self, games: &[GoGame]) -> Result<(f32, usize), String> {
+        let mut squared_error = 0.0;
+        let mut positions = 0usize;
+        for game in games.iter().filter(|game| game.size == self.size) {
+            validate_game(game)?;
+            let komi = game.komi_value()?;
+            let mut board = GoBoard::with_setup(
+                self.size,
+                &game.black_setup,
+                &game.white_setup,
+                game.first_turn,
+            )?;
+            for &action in &game.moves {
+                let target = match game.winner {
+                    0 => 0.0,
+                    winner if winner == board.turn => 1.0,
+                    _ => -1.0,
+                };
+                let error = target - self.value_with_komi(&board, komi);
+                squared_error += error * error;
+                positions += 1;
+                board.play(action)?;
+            }
+        }
+        if positions == 0 {
+            return Err("Go evaluation set contains no moves for this board size".into());
+        }
+        Ok((squared_error / positions as f32, positions))
+    }
+
+    fn evaluate_objective(&self, games: &[GoGame]) -> Result<(f32, f32), String> {
+        let mut squared_error = 0.0;
+        let mut objective = 0.0;
+        let mut positions = 0usize;
+        for game in games.iter().filter(|game| game.size == self.size) {
+            validate_game(game)?;
+            let komi = game.komi_value()?;
+            let mut board = GoBoard::with_setup(
+                self.size,
+                &game.black_setup,
+                &game.white_setup,
+                game.first_turn,
+            )?;
+            for &action in &game.moves {
+                let target = match game.winner {
+                    0 => 0.0,
+                    winner if winner == board.turn => 1.0,
+                    _ => -1.0,
+                };
+                let features = board.features_with_komi(komi);
+                let active = self.activations_from_features(&features);
+                let prediction = self.value_from_activations(&active);
+                let value_error = target - prediction;
+                let legal = board.legal_moves();
+                let probabilities = self.policy_probabilities(&legal, &active);
+                let target_index = legal
+                    .iter()
+                    .position(|&candidate| candidate == action)
+                    .ok_or("Go validation move is not legal")?;
+                let value_loss = value_error * value_error;
+                let policy_loss = -probabilities[target_index].max(f32::MIN_POSITIVE).ln();
+                squared_error += value_loss;
+                objective += value_loss + policy_loss;
+                positions += 1;
+                board.play(action)?;
+            }
+        }
+        if positions == 0 {
+            return Err("Go evaluation set contains no moves for this board size".into());
+        }
+        Ok((
+            squared_error / positions as f32,
+            objective / positions as f32,
+        ))
+    }
+
+    pub fn evaluate_policy_top1(&self, games: &[GoGame]) -> Result<(f32, f32, usize), String> {
+        let mut correct = 0.0;
+        let mut random_correct = 0.0;
+        let mut positions = 0usize;
+        for game in games.iter().filter(|game| game.size == self.size) {
+            validate_game(game)?;
+            let komi = game.komi_value()?;
+            let mut board = GoBoard::with_setup(
+                self.size,
+                &game.black_setup,
+                &game.white_setup,
+                game.first_turn,
+            )?;
+            for &action in &game.moves {
+                let active = self.activations(&board, komi);
+                let legal = board.legal_moves();
+                let mut best = f32::NEG_INFINITY;
+                let mut best_count = 0usize;
+                let mut chosen = f32::NEG_INFINITY;
+                for candidate in legal.iter().copied() {
+                    let score = self.policy_from_activations(candidate, &active);
+                    if candidate == action {
+                        chosen = score;
+                    }
+                    match score.total_cmp(&best) {
+                        std::cmp::Ordering::Greater => {
+                            best = score;
+                            best_count = 1;
+                        }
+                        std::cmp::Ordering::Equal => best_count += 1,
+                        std::cmp::Ordering::Less => {}
+                    }
+                }
+                if chosen.total_cmp(&best) == std::cmp::Ordering::Equal {
+                    correct += 1.0 / best_count as f32;
+                }
+                random_correct += 1.0 / legal.len() as f32;
+                positions += 1;
+                board.play(action)?;
+            }
+        }
+        if positions == 0 {
+            return Err("Go policy evaluation set contains no moves for this board size".into());
+        }
+        Ok((
+            correct / positions as f32,
+            random_correct / positions as f32,
+            positions,
+        ))
+    }
+
+    pub fn train_with_validation(
+        &mut self,
+        training_games: &[GoGame],
+        validation_games: &[GoGame],
+        epochs: usize,
+        seed: u64,
+    ) -> Result<(usize, f32, f32), String> {
+        let (mut best_value_loss, mut best_objective) =
+            self.evaluate_objective(validation_games)?;
+        let mut best_model = self.clone();
+        let mut best_epoch = 0usize;
+        for epoch in 0..epochs {
+            self.train(training_games, 1, seed.wrapping_add(epoch as u64))?;
+            let (validation_value_loss, validation_objective) =
+                self.evaluate_objective(validation_games)?;
+            if validation_objective < best_objective {
+                best_value_loss = validation_value_loss;
+                best_objective = validation_objective;
+                best_epoch = epoch + 1;
+                best_model = self.clone();
+            }
+        }
+        *self = best_model;
+        let train_loss = self.evaluate_loss(training_games)?.0;
+        Ok((best_epoch, train_loss, best_value_loss))
+    }
+
+    pub fn edge_count(&self) -> usize {
+        self.nodes.iter().map(|node| node.edges.len()).sum()
+    }
+
+    pub fn save(&self, path: &str) -> Result<(), String> {
+        let mut writer = BufWriter::new(File::create(path).map_err(|error| error.to_string())?);
+        writeln!(
+            writer,
+            "GNS3 {} {} {} {} {} {} {} {} {} {} {} {} {}",
+            self.size,
+            self.step,
+            self.cfg.max_nodes,
+            self.cfg.max_edges_per_node,
+            self.cfg.top_k,
+            self.cfg.learning_rate,
+            self.cfg.value_learning_rate,
+            self.cfg.policy_learning_rate,
+            self.cfg.novelty_threshold,
+            self.cfg.error_threshold,
+            self.cfg.prune_strength,
+            self.cfg.dormancy_steps,
+            self.cfg.growth_rule
+        )
+        .map_err(|error| error.to_string())?;
+        for node in &self.nodes {
+            write!(
+                writer,
+                "N {} {} {}",
+                node.bias, node.utility, node.dormant as u8
+            )
+            .map_err(|error| error.to_string())?;
+            for edge in &node.edges {
+                write!(
+                    writer,
+                    " {}:{}:{}:{}",
+                    edge.input, edge.weight, edge.strength, edge.last_active
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            writeln!(writer).map_err(|error| error.to_string())?;
+        }
+        writeln!(
+            writer,
+            "V {}",
+            self.value_weights
+                .iter()
+                .map(f32::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+        .map_err(|error| error.to_string())?;
+        for action in 0..=self.size * self.size {
+            let start = action * self.cfg.max_nodes;
+            writeln!(
+                writer,
+                "P {action} {}",
+                self.policy_weights[start..start + self.cfg.max_nodes]
+                    .iter()
+                    .map(f32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub fn load(path: &str) -> Result<Self, String> {
+        let mut lines =
+            BufReader::new(File::open(path).map_err(|error| error.to_string())?).lines();
+        let header = lines
+            .next()
+            .ok_or("empty Go sparse checkpoint")?
+            .map_err(|error| error.to_string())?;
+        let fields: Vec<_> = header.split_whitespace().collect();
+        if !matches!(
+            (fields.first().copied(), fields.len()),
+            (Some("GNS2"), 13) | (Some("GNS3"), 14)
+        ) {
+            return Err(
+                "unsupported Go checkpoint; train the Go sparse model to create GNS3".into(),
+            );
+        }
+        let parse_usize = |index: usize| {
+            fields[index]
+                .parse::<usize>()
+                .map_err(|_| "invalid Go sparse checkpoint".to_string())
+        };
+        let parse_f32 = |index: usize| {
+            fields[index]
+                .parse::<f32>()
+                .map_err(|_| "invalid Go sparse checkpoint".to_string())
+        };
+        let size = parse_usize(1)?;
+        let step = fields[2]
+            .parse::<u64>()
+            .map_err(|_| "invalid Go sparse checkpoint")?;
+        let cfg = GoSparseConfig {
+            max_nodes: parse_usize(3)?,
+            max_edges_per_node: parse_usize(4)?,
+            top_k: parse_usize(5)?,
+            learning_rate: parse_f32(6)?,
+            value_learning_rate: parse_f32(7)?,
+            policy_learning_rate: parse_f32(8)?,
+            novelty_threshold: parse_f32(9)?,
+            error_threshold: parse_f32(10)?,
+            prune_strength: parse_f32(11)?,
+            dormancy_steps: fields[12]
+                .parse::<u64>()
+                .map_err(|_| "invalid Go sparse checkpoint")?,
+            growth_rule: if fields[0] == "GNS3" {
+                fields[13]
+                    .parse::<u8>()
+                    .map_err(|_| "invalid Go sparse growth rule")?
+            } else {
+                0
+            },
+        };
+        if size < 5
+            || size > 19
+            || cfg.max_nodes == 0
+            || cfg.top_k == 0
+            || cfg.top_k > cfg.max_nodes
+            || cfg.growth_rule > 1
+        {
+            return Err("invalid Go sparse checkpoint dimensions".into());
+        }
+        let mut model = Self {
+            size,
+            value_weights: vec![0.0; cfg.max_nodes],
+            policy_weights: vec![0.0; (size * size + 1) * cfg.max_nodes],
+            cfg,
+            nodes: Vec::new(),
+            step,
+        };
+        let mut value_seen = false;
+        let mut policy_seen = vec![false; size * size + 1];
+        for line in lines {
+            let line = line.map_err(|error| error.to_string())?;
+            let parts: Vec<_> = line.split_whitespace().collect();
+            match parts.first().copied() {
+                Some("N") if parts.len() >= 4 => {
+                    let mut edges = Vec::new();
+                    for part in &parts[4..] {
+                        let edge: Vec<_> = part.split(':').collect();
+                        if edge.len() != 4 {
+                            return Err("invalid Go sparse checkpoint edge".into());
+                        }
+                        let input = edge[0]
+                            .parse::<usize>()
+                            .map_err(|_| "invalid Go sparse checkpoint edge")?;
+                        if input >= size * size * 8 + 2 {
+                            return Err("Go sparse checkpoint edge is out of range".into());
+                        }
+                        edges.push(GoSparseEdge {
+                            input: input as u16,
+                            weight: edge[1]
+                                .parse()
+                                .map_err(|_| "invalid Go sparse checkpoint edge")?,
+                            strength: edge[2]
+                                .parse()
+                                .map_err(|_| "invalid Go sparse checkpoint edge")?,
+                            last_active: edge[3]
+                                .parse()
+                                .map_err(|_| "invalid Go sparse checkpoint edge")?,
+                        });
+                    }
+                    model.nodes.push(GoSparseNode {
+                        bias: parts[1]
+                            .parse()
+                            .map_err(|_| "invalid Go sparse checkpoint node")?,
+                        utility: parts[2]
+                            .parse()
+                            .map_err(|_| "invalid Go sparse checkpoint node")?,
+                        dormant: parts[3] == "1",
+                        edges,
+                    });
+                }
+                Some("V") if !value_seen && parts.len() == model.cfg.max_nodes + 1 => {
+                    for (weight, value) in model.value_weights.iter_mut().zip(&parts[1..]) {
+                        *weight = value
+                            .parse()
+                            .map_err(|_| "invalid Go sparse checkpoint value head")?;
+                    }
+                    value_seen = true;
+                }
+                Some("P") if parts.len() == model.cfg.max_nodes + 2 => {
+                    let action = parts[1]
+                        .parse::<usize>()
+                        .map_err(|_| "invalid Go sparse checkpoint policy head")?;
+                    if action >= policy_seen.len() || policy_seen[action] {
+                        return Err("invalid Go sparse checkpoint policy action".into());
+                    }
+                    let start = action * model.cfg.max_nodes;
+                    for (weight, value) in model.policy_weights[start..start + model.cfg.max_nodes]
+                        .iter_mut()
+                        .zip(&parts[2..])
+                    {
+                        *weight = value
+                            .parse()
+                            .map_err(|_| "invalid Go sparse checkpoint policy head")?;
+                    }
+                    policy_seen[action] = true;
+                }
+                _ => return Err("invalid Go sparse checkpoint record".into()),
+            }
+        }
+        if model.nodes.len() > model.cfg.max_nodes || !value_seen || policy_seen.contains(&false) {
+            return Err("incomplete Go sparse checkpoint".into());
+        }
+        Ok(model)
+    }
+}
+
 #[derive(Clone)]
 pub struct GoModel {
     pub size: usize,
@@ -1445,6 +2516,85 @@ pub fn benchmark_with_komi(
     Ok((wins, games - wins))
 }
 
+pub fn benchmark_sparse_with_komi(
+    model: &GoSparseModel,
+    games: usize,
+    seed: u64,
+    heuristic: bool,
+    komi: f32,
+) -> Result<(usize, usize), String> {
+    if games == 0 || !komi.is_finite() {
+        return Err("invalid Go benchmark game count or komi".into());
+    }
+    let mut rng = Rng::new(seed);
+    let mut wins = 0;
+    for game_index in 0..games {
+        let model_black = game_index % 2 == 0;
+        let mut board = GoBoard::new(model.size)?;
+        while !board.terminal() {
+            let model_turn = (board.turn == 1) == model_black;
+            let action = if model_turn {
+                model.choose_with_komi(&board, &mut rng, komi)
+            } else {
+                let legal = board.legal_moves();
+                if heuristic {
+                    heuristic_move(&board, &legal, &mut rng)
+                } else {
+                    legal[rng.usize(legal.len())]
+                }
+            };
+            board.play(action)?;
+        }
+        let black_win = board.score_black(komi) > 0.0;
+        if black_win == model_black {
+            wins += 1;
+        }
+    }
+    Ok((wins, games - wins))
+}
+
+pub fn benchmark_mcts_with_komi(
+    model: &GoSparseModel,
+    games: usize,
+    seed: u64,
+    simulations: usize,
+    cpuct: f32,
+    komi: f32,
+    heuristic: bool,
+) -> Result<GoMctsBenchmarkResults, String> {
+    if games == 0 || !komi.is_finite() {
+        return Err("invalid Go MCTS benchmark game count or komi".into());
+    }
+    let mut rng = Rng::new(seed);
+    let mut results = GoMctsBenchmarkResults::default();
+    for game_index in 0..games {
+        let model_black = game_index % 2 == 0;
+        let mut board = GoBoard::new(model.size)?;
+        while !board.terminal() {
+            let model_turn = (board.turn == 1) == model_black;
+            let action = if model_turn {
+                model.choose_mcts_with_komi(&board, simulations, cpuct, komi)?
+            } else {
+                let legal = board.legal_moves();
+                if heuristic {
+                    heuristic_move(&board, &legal, &mut rng)
+                } else {
+                    legal[rng.usize(legal.len())]
+                }
+            };
+            board.play(action)?;
+        }
+        let score = board.score_black(komi);
+        let result = if score == 0.0 {
+            None
+        } else {
+            Some((score > 0.0) == model_black)
+        };
+        results.record(model_black, result);
+    }
+    Ok(results)
+}
+
 fn gtp_query(
     input: &mut BufWriter<ChildStdin>,
     output: &mut BufReader<ChildStdout>,
@@ -1531,14 +2681,35 @@ fn parse_gtp_vertex(vertex: &str, board: &GoBoard) -> Result<Option<usize>, Stri
     Ok(Some((board.size - row) * board.size + col))
 }
 
-pub fn benchmark_gtp(
-    model: &GoModel,
+fn parse_gtp_final_score(score: &str) -> Result<Option<i8>, String> {
+    match score {
+        "0" | "Jigo" | "Draw" => Ok(None),
+        value if value.starts_with("B+") || value.starts_with("W+") => {
+            let winner = if value.starts_with("B+") { 1 } else { -1 };
+            let margin = value[2..]
+                .parse::<f32>()
+                .map_err(|_| format!("invalid GTP final score: {score}"))?;
+            if !margin.is_finite() || margin < 0.0 {
+                return Err(format!("invalid GTP final score: {score}"));
+            }
+            Ok(Some(winner))
+        }
+        _ => Err(format!("unsupported GTP final score: {score}")),
+    }
+}
+
+fn benchmark_gtp_with_selector<F>(
+    model: &GoSparseModel,
     engine: &str,
     engine_args: &[String],
     games: usize,
     seed: u64,
     komi: f32,
-) -> Result<GtpBenchmarkResults, String> {
+    mut select_move: F,
+) -> Result<GtpBenchmarkResults, String>
+where
+    F: FnMut(&GoSparseModel, &GoBoard, &mut Rng, f32) -> Result<usize, String>,
+{
     if games == 0 {
         return Err("GTP benchmark requires at least one game".into());
     }
@@ -1570,7 +2741,7 @@ pub fn benchmark_gtp(
             let mut resigned = false;
             while !board.terminal() {
                 if board.turn == model_color {
-                    let action = model.choose_with_komi(&board, &mut rng, komi);
+                    let action = select_move(model, &board, &mut rng, komi)?;
                     gtp_query(
                         &mut input,
                         &mut output,
@@ -1612,6 +2783,22 @@ pub fn benchmark_gtp(
                 } else {
                     results.record(model_color, None);
                 }
+                let engine_score = gtp_query(&mut input, &mut output, "final_score")?;
+                let engine_winner = parse_gtp_final_score(&engine_score)?;
+                let local_winner = if score > 0.0 {
+                    Some(1)
+                } else if score < 0.0 {
+                    Some(-1)
+                } else {
+                    None
+                };
+                if engine_winner != local_winner {
+                    results.score_disagreements += 1;
+                }
+                results.replace_last_result(
+                    model_color,
+                    engine_winner.map(|winner| winner == model_color),
+                );
             }
         }
         Ok(results)
@@ -1631,6 +2818,49 @@ pub fn benchmark_gtp(
     }
 }
 
+pub fn benchmark_gtp(
+    model: &GoSparseModel,
+    engine: &str,
+    engine_args: &[String],
+    games: usize,
+    seed: u64,
+    komi: f32,
+) -> Result<GtpBenchmarkResults, String> {
+    benchmark_gtp_with_selector(
+        model,
+        engine,
+        engine_args,
+        games,
+        seed,
+        komi,
+        |model, board, rng, komi| Ok(model.choose_with_komi(board, rng, komi)),
+    )
+}
+
+pub fn benchmark_gtp_mcts(
+    model: &GoSparseModel,
+    engine: &str,
+    engine_args: &[String],
+    games: usize,
+    seed: u64,
+    komi: f32,
+    simulations: usize,
+    cpuct: f32,
+) -> Result<GtpBenchmarkResults, String> {
+    if simulations == 0 || !cpuct.is_finite() || cpuct <= 0.0 {
+        return Err("invalid Go MCTS settings".into());
+    }
+    benchmark_gtp_with_selector(
+        model,
+        engine,
+        engine_args,
+        games,
+        seed,
+        komi,
+        |model, board, _, komi| model.choose_mcts_with_komi(board, simulations, cpuct, komi),
+    )
+}
+
 #[derive(Default)]
 pub struct GtpBenchmarkResults {
     pub wins: usize,
@@ -1638,16 +2868,59 @@ pub struct GtpBenchmarkResults {
     pub draws: usize,
     pub model_black: (usize, usize, usize),
     pub model_white: (usize, usize, usize),
+    pub score_disagreements: usize,
+    recorded_outcomes: Vec<Option<bool>>,
 }
 
 impl GtpBenchmarkResults {
     fn record(&mut self, model_color: i8, win: Option<bool>) {
+        self.recorded_outcomes.push(win);
         let color_results = if model_color == 1 {
             &mut self.model_black
         } else {
             &mut self.model_white
         };
         match win {
+            Some(true) => {
+                self.wins += 1;
+                color_results.0 += 1;
+            }
+            Some(false) => {
+                self.losses += 1;
+                color_results.1 += 1;
+            }
+            None => {
+                self.draws += 1;
+                color_results.2 += 1;
+            }
+        }
+    }
+
+    fn replace_last_result(&mut self, model_color: i8, result: Option<bool>) {
+        let Some(previous) = self.recorded_outcomes.last_mut() else {
+            return;
+        };
+        let color_results = if model_color == 1 {
+            &mut self.model_black
+        } else {
+            &mut self.model_white
+        };
+        match *previous {
+            Some(true) => {
+                self.wins -= 1;
+                color_results.0 -= 1;
+            }
+            Some(false) => {
+                self.losses -= 1;
+                color_results.1 -= 1;
+            }
+            None => {
+                self.draws -= 1;
+                color_results.2 -= 1;
+            }
+        }
+        *previous = result;
+        match result {
             Some(true) => {
                 self.wins += 1;
                 color_results.0 += 1;
@@ -1669,15 +2942,119 @@ mod tests {
     use super::*;
 
     #[test]
+    fn go_sparse_model_trains_and_roundtrips_checkpoint() {
+        let game = GoGame {
+            size: 5,
+            moves: vec![0, 1, 5, 6, 25, 2],
+            winner: 1,
+            result: None,
+            komi: Some("0.5".into()),
+            first_turn: 1,
+            black_setup: Vec::new(),
+            white_setup: Vec::new(),
+        };
+        let config = GoSparseConfig {
+            growth_rule: 1,
+            ..GoSparseConfig::default()
+        };
+        let mut model = GoSparseModel::new(5, config, 17).unwrap();
+        let initial_value = model.value_with_komi(&GoBoard::new(5).unwrap(), 0.5);
+        let loss = model.train(std::slice::from_ref(&game), 2, 19).unwrap();
+        assert!(loss.is_finite());
+        let board = GoBoard::new(5).unwrap();
+        assert_ne!(model.value_with_komi(&board, 0.5), initial_value);
+        let selected = model.choose_with_komi(&board, &mut Rng::new(23), 0.5);
+        assert!(board.legal_moves().contains(&selected));
+        let (policy_accuracy, random_baseline, evaluated_positions) = model
+            .evaluate_policy_top1(std::slice::from_ref(&game))
+            .unwrap();
+        assert!((0.0..=1.0).contains(&policy_accuracy));
+        assert!((0.0..=1.0).contains(&random_baseline));
+        assert_eq!(evaluated_positions, game.moves.len());
+        assert!(model.edge_count() >= model.nodes.len());
+        let path =
+            std::env::temp_dir().join(format!("neurofour-go-sparse-{}.gns", std::process::id()));
+        model.save(path.to_str().unwrap()).unwrap();
+        let loaded = GoSparseModel::load(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(loaded.size, model.size);
+        assert_eq!(loaded.nodes.len(), model.nodes.len());
+        assert_eq!(loaded.step, model.step);
+        assert_eq!(loaded.cfg.growth_rule, 1);
+        assert_eq!(
+            loaded.value_with_komi(&board, 0.5),
+            model.value_with_komi(&board, 0.5)
+        );
+    }
+
+    #[test]
+    fn go_features_encode_relative_group_liberties_and_symmetries() {
+        let board = GoBoard::with_setup(5, &[0], &[1], 1).unwrap();
+        let features = board.features_with_komi(0.5);
+        let points = 25;
+        let tactical_start = points * 2 + 2;
+        assert_eq!(features.len(), points * 8 + 2);
+        assert_eq!(features[tactical_start], 1.0);
+        assert_eq!(features[tactical_start + points * 4 + 1], 1.0);
+
+        let game = GoGame {
+            size: 5,
+            moves: vec![0, 1, 5, 6, 25, 2],
+            winner: 1,
+            result: None,
+            komi: Some("0.5".into()),
+            first_turn: 1,
+            black_setup: Vec::new(),
+            white_setup: Vec::new(),
+        };
+        let symmetries = augment_game_symmetries(&game);
+        assert_eq!(symmetries.len(), 8);
+        for transformed in symmetries {
+            validate_game(&transformed).unwrap();
+            assert_eq!(transformed.moves.len(), game.moves.len());
+        }
+    }
+
+    #[test]
+    fn go_mcts_returns_legal_moves_and_rejects_invalid_settings() {
+        let model = GoSparseModel::new(5, GoSparseConfig::default(), 5).unwrap();
+        let board = GoBoard::new(5).unwrap();
+        let action = model.choose_mcts_with_komi(&board, 8, 1.4, 0.5).unwrap();
+        assert!(board.legal_moves().contains(&action));
+        assert!(model.choose_mcts_with_komi(&board, 0, 1.4, 0.5).is_err());
+    }
+
+    #[test]
+    fn go_mcts_benchmark_tracks_color_and_draw_results() {
+        let mut results = GoMctsBenchmarkResults::default();
+        results.record(true, Some(true));
+        results.record(false, Some(false));
+        results.record(true, None);
+
+        assert_eq!((results.wins, results.losses, results.draws), (1, 1, 1));
+        assert_eq!(results.model_black, (1, 0, 1));
+        assert_eq!(results.model_white, (0, 1, 0));
+    }
+
+    #[test]
     fn gtp_benchmark_results_track_outcomes_by_color() {
         let mut results = GtpBenchmarkResults::default();
         results.record(1, Some(true));
         results.record(-1, Some(false));
         results.record(-1, None);
+        results.replace_last_result(-1, Some(true));
 
-        assert_eq!((results.wins, results.losses, results.draws), (1, 1, 1));
+        assert_eq!((results.wins, results.losses, results.draws), (2, 1, 0));
         assert_eq!(results.model_black, (1, 0, 0));
-        assert_eq!(results.model_white, (0, 1, 1));
+        assert_eq!(results.model_white, (1, 1, 0));
+    }
+
+    #[test]
+    fn gtp_final_score_parser_handles_wins_losses_and_draws() {
+        assert_eq!(parse_gtp_final_score("B+3.5").unwrap(), Some(1));
+        assert_eq!(parse_gtp_final_score("W+7.5").unwrap(), Some(-1));
+        assert_eq!(parse_gtp_final_score("0").unwrap(), None);
+        assert!(parse_gtp_final_score("B+R").is_err());
     }
 
     #[test]
@@ -1869,12 +3246,12 @@ mod tests {
     fn komi_feature_is_normalized_and_relative_to_side_to_move() {
         let mut board = GoBoard::new(5).unwrap();
         assert_eq!(
-            board.features_with_komi(6.5).last().copied(),
+            board.features_with_komi(6.5).get(5 * 5 * 2 + 1).copied(),
             Some(-6.5 / 25.0)
         );
         board.play(board.pass_action()).unwrap();
         assert_eq!(
-            board.features_with_komi(6.5).last().copied(),
+            board.features_with_komi(6.5).get(5 * 5 * 2 + 1).copied(),
             Some(6.5 / 25.0)
         );
     }
