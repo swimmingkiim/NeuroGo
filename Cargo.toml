@@ -1,0 +1,12 @@
+[package]
+name = "neurofour"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Low-resource dynamic sparse neural network research playground for Connect Four"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
