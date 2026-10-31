@@ -362,13 +362,21 @@ cargo run --release -- go-import-sgf \
   data/go/kgs-2019-04 data/go/kgs-2019-04.csv
 cargo run --release -- go-train \
   data/go/kgs-2019-04.csv checkpoints/go/kgs-2019-04.ngo 1 42
+cargo run --release -- go-benchmark \
+  checkpoints/go/kgs-2019-04.ngo 10 777
+cargo run --release -- go-benchmark \
+  checkpoints/go/kgs-2019-04.ngo 10 777 0.5
 cargo run --release -- go-export-sgf \
   data/go/kgs-2019-04.csv data/go/kgs-2019-04-export.sgf
 ```
 
 `go-import-sgf`는 SGF 파일 하나 또는 디렉터리의 `.sgf` 파일을 읽고, 각 컬렉션의 첫 번째 변형을 주계보로 사용합니다. 보드 크기, 승패/무승부, 패스, 핸디캡 배치(`AB`/`AW`/`AE`), 다음 차례(`PL`)를 가져오며 모든 착수를 현재 규칙과 positional superko로 검증합니다. 결과가 없거나 Go 이외 게임인 기록은 건너뜁니다. 현재 아카이브에서는 1,231판을 가져오고 24판을 제외했습니다. `go-export-sgf`는 지원 데이터 형식의 게임을 SGF로 출력하며, `RE` 결과 문자열도 보존합니다.
 
-학습용 CSV 형식은 `size,winner,first_turn,black_setup,white_setup,moves,result,komi`입니다. setup 위치는 보드의 0 기반 인덱스를 `:`로 구분하며 빈 setup은 `-`입니다. 기존 `size,winner,moves` 행도 계속 읽을 수 있습니다. SGF 왕복 시 승패·착수·핸디캡·차례·결과·komi를 보존합니다. 1 epoch 학습은 1,231판·232,601착에서 6.23초, loss `.141487`이었습니다. seed 777의 10판 smoke 평가에서는 random 및 heuristic 상대에 모두 0승이었습니다. 이 작은 평가만으로 모델 기력을 결론 내릴 수는 없습니다.
+학습용 CSV 형식은 `size,winner,first_turn,black_setup,white_setup,moves,result,komi`입니다. setup 위치는 보드의 0 기반 인덱스를 `:`로 구분하며 빈 setup은 `-`입니다. 기존 7열 CSV와 `size,winner,moves` 행도 계속 읽을 수 있으며, komi 누락 행은 6.5로 처리합니다. 기록을 적재할 때 winner/result 일치, komi 유효성, 모든 착수의 합법성 및 종료 후 추가 착수를 검증합니다. SGF 왕복 시 승패·착수·핸디캡·차례·결과·komi를 보존합니다.
+
+선형 policy/value 모델은 현재 플레이어 기준 komi를 보드 면적으로 정규화한 입력 feature로 사용합니다. 예전 `NGO1` 체크포인트도 로드할 수 있으며 새 형식 `NGO2`로 저장할 때 komi 가중치는 0으로 초기화되어 기존 출력이 유지됩니다. `go-benchmark`의 선택 인자 `[komi=6.5]`로 기본값 이외의 komi도 지정할 수 있습니다.
+
+KGS 데이터 1,231판·232,601착을 1 epoch 학습한 최신 결과는 7.73초, loss `.141306`입니다. 기존 `NGO1` 체크포인트 로드 후 벤치마크도 확인했습니다. 새 체크포인트는 seed 777로 komi 0.5와 6.5에서 각각 random 및 heuristic 상대와 10판씩 대국했으며 모두 0승이었습니다. 이는 실행 및 komi 입력 경로의 smoke test이지 실력 평가가 아닙니다.
 
 합법 수 계산은 빈 칸마다 보드를 복제해 착수 가능 여부를 확인하는 대신, 한 번의 보드 순회로 각 돌 그룹의 활로 수를 계산한 뒤 인접 그룹만 검사합니다. positional superko는 64비트 위치 해시 집합으로 확인하고, 평가용 임시 착수는 history를 복제하지 않습니다. 이 변경 후 같은 seed의 생성 시간은 9×9 200판에서 2.16초→1.29초, 19×19 30판에서 13.56초→6.65초였습니다. 환경에 따라 시간은 달라집니다.
 
@@ -379,4 +387,4 @@ cargo run --release -- go-export-sgf \
 
 19×19 데이터는 30판에서 300판으로 늘렸지만, 평가 상대별 10판은 여전히 실력 결론에 부족합니다. 특히 내장 heuristic은 포획과 중앙 선호만 사용하는 약한 상대이며 같은 계열의 self-play 데이터도 강한 기력을 보장하지 않습니다. 따라서 이 결과는 개선된 생성 속도와 19×19 규칙→데이터→학습→체크포인트→대국 경로를 확인하는 smoke benchmark입니다.
 
-현재 Go 모델은 완성된 동적 희소 모델이 아니라 공정 비교를 위한 선형 하한선입니다. 아직 SGF 입출력과 공개 기보 학습, ownership/score 보조 head, 지역 연결을 가진 동적 희소 trunk, 제한 MCTS, GNU Go/Pachi/KataGo 대국 검증이 없습니다. 이 항목들을 구현하고 최소 수천 판 또는 공개 SGF를 학습하기 전에는 KataGo와 실력을 비교하면 안 됩니다.
+현재 Go 모델은 완성된 동적 희소 모델이 아니라 공정 비교를 위한 선형 하한선입니다. SGF 입출력과 KGS 공개 기보 학습까지 연결했지만, ownership·score·활로 보조 head, 지역 연결을 가진 동적 희소 trunk, policy 상위 수를 확장하는 제한 MCTS, GNU Go/Pachi/KataGo 고정 예산 대국은 아직 남아 있습니다. 강도 비교 전에는 게임 단위 train/validation 분리, 여러 seed, 최소 수천 판의 평가도 추가해야 합니다. 현재 KGS smoke 평가만으로 KataGo와 실력을 비교하면 안 됩니다.

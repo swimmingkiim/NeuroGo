@@ -378,6 +378,13 @@ impl GoBoard {
         x[n * 2] = 1.0;
         x
     }
+
+    pub fn features_with_komi(&self, komi: f32) -> Vec<f32> {
+        let mut features = self.features();
+        let turn_komi = if self.turn == 1 { -komi } else { komi };
+        features.push(turn_komi / self.cells.len() as f32);
+        features
+    }
 }
 
 #[derive(Clone)]
@@ -390,6 +397,19 @@ pub struct GoGame {
     pub first_turn: i8,
     pub black_setup: Vec<usize>,
     pub white_setup: Vec<usize>,
+}
+
+impl GoGame {
+    pub fn komi_value(&self) -> Result<f32, String> {
+        let komi = match &self.komi {
+            Some(value) => value.parse::<f32>().map_err(|_| "invalid Go komi")?,
+            None => 6.5,
+        };
+        if !komi.is_finite() {
+            return Err("invalid Go komi".into());
+        }
+        Ok(komi)
+    }
 }
 pub fn generate(path: &str, size: usize, games: usize, seed: u64) -> Result<(), String> {
     let mut rng = Rng::new(seed);
@@ -506,8 +526,42 @@ pub fn load_games(path: &str) -> Result<Vec<GoGame>, String> {
             black_setup,
             white_setup,
         });
+        validate_game(out.last().ok_or("missing loaded Go game")?)?;
     }
     Ok(out)
+}
+
+pub fn validate_game(game: &GoGame) -> Result<(), String> {
+    if !matches!(game.winner, -1..=1) {
+        return Err("Go winner must be -1, 0, or 1".into());
+    }
+    game.komi_value()?;
+    let mut board = GoBoard::with_setup(
+        game.size,
+        &game.black_setup,
+        &game.white_setup,
+        game.first_turn,
+    )?;
+    if let Some(result) = &game.result {
+        let result_winner = match result.as_str() {
+            "0" | "Draw" | "Jigo" => Some(0),
+            value if value.starts_with("B+") => Some(1),
+            value if value.starts_with("W+") => Some(-1),
+            _ => None,
+        };
+        if result_winner.is_some_and(|result_winner| result_winner != game.winner) {
+            return Err("Go winner does not match recorded result".into());
+        }
+    }
+    for (ply, &action) in game.moves.iter().enumerate() {
+        if board.terminal() {
+            return Err(format!("Go move after game ended at ply {}", ply + 1));
+        }
+        board
+            .play(action)
+            .map_err(|error| format!("illegal Go move at ply {}: {error}", ply + 1))?;
+    }
+    Ok(())
 }
 
 fn parse_points(value: &str, size: usize) -> Result<Vec<usize>, String> {
@@ -992,7 +1046,7 @@ pub struct GoModel {
 }
 impl GoModel {
     pub fn new(size: usize) -> Self {
-        let f = size * size * 2 + 1;
+        let f = size * size * 2 + 2;
         Self {
             size,
             value: vec![0.0; f],
@@ -1003,16 +1057,23 @@ impl GoModel {
         w.iter().zip(x).map(|(a, b)| a * b).sum()
     }
     pub fn value(&self, b: &GoBoard) -> f32 {
-        Self::dot(&self.value, &b.features()).tanh()
+        self.value_with_komi(b, 6.5)
+    }
+    pub fn value_with_komi(&self, b: &GoBoard, komi: f32) -> f32 {
+        Self::dot(&self.value, &b.features_with_komi(komi)).tanh()
     }
     pub fn choose(&self, b: &GoBoard, rng: &mut Rng) -> usize {
-        let x = b.features();
+        self.choose_with_komi(b, rng, 6.5)
+    }
+    pub fn choose_with_komi(&self, b: &GoBoard, rng: &mut Rng, komi: f32) -> usize {
+        let x = b.features_with_komi(komi);
         let f = x.len();
         let mut scored = Vec::new();
         for a in b.legal_moves() {
             let mut next = b.clone();
             next.play_for_analysis(a).unwrap();
-            let s = Self::dot(&self.policy[a * f..(a + 1) * f], &x) - self.value(&next);
+            let s =
+                Self::dot(&self.policy[a * f..(a + 1) * f], &x) - self.value_with_komi(&next, komi);
             scored.push((s, rng.next_u64(), a));
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then_with(|| b.1.cmp(&a.1)));
@@ -1022,6 +1083,10 @@ impl GoModel {
         let mut rng = Rng::new(seed);
         let f = self.value.len();
         let mut loss = 0.0;
+        for game in games.iter().filter(|game| game.size == self.size) {
+            validate_game(game)?;
+            game.komi_value()?;
+        }
         for _ in 0..epochs {
             let mut order: Vec<_> = (0..games.len()).collect();
             rng.shuffle(&mut order);
@@ -1032,6 +1097,7 @@ impl GoModel {
                 if game.size != self.size {
                     continue;
                 }
+                let komi = game.komi_value()?;
                 let mut b = GoBoard::with_setup(
                     self.size,
                     &game.black_setup,
@@ -1039,7 +1105,7 @@ impl GoModel {
                     game.first_turn,
                 )?;
                 for &action in &game.moves {
-                    let x = b.features();
+                    let x = b.features_with_komi(komi);
                     let target = match game.winner {
                         0 => 0.0,
                         winner if winner == b.turn => 1.0,
@@ -1074,7 +1140,7 @@ impl GoModel {
     }
     pub fn save(&self, path: &str) -> Result<(), String> {
         let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
-        writeln!(w, "NGO1 {}", self.size).map_err(|e| e.to_string())?;
+        writeln!(w, "NGO2 {}", self.size).map_err(|e| e.to_string())?;
         for v in self.value.iter().chain(self.policy.iter()) {
             writeln!(w, "{v}").map_err(|e| e.to_string())?;
         }
@@ -1086,12 +1152,16 @@ impl GoModel {
             .next()
             .ok_or("empty Go model")?
             .map_err(|e| e.to_string())?;
-        let size = h
-            .split_whitespace()
-            .nth(1)
+        let mut header = h.split_whitespace();
+        let version = header.next().ok_or("bad Go model")?;
+        let size = header
+            .next()
             .ok_or("bad Go model")?
             .parse()
             .map_err(|_| "bad size")?;
+        if header.next().is_some() || !matches!(version, "NGO1" | "NGO2") {
+            return Err("unsupported Go model".into());
+        }
         let mut m = Self::new(size);
         let vals = lines
             .map(|l| {
@@ -1101,6 +1171,21 @@ impl GoModel {
             })
             .collect::<Result<Vec<f32>, _>>()?;
         let f = m.value.len();
+        let legacy_features = f - 1;
+        if version == "NGO1" && vals.len() == legacy_features + (size * size + 1) * legacy_features
+        {
+            for (target, source) in m.value.iter_mut().zip(&vals[..legacy_features]) {
+                *target = *source;
+            }
+            let old_policy = &vals[legacy_features..];
+            for action in 0..=size * size {
+                let new_start = action * f;
+                let old_start = action * legacy_features;
+                m.policy[new_start..new_start + legacy_features]
+                    .copy_from_slice(&old_policy[old_start..old_start + legacy_features]);
+            }
+            return Ok(m);
+        }
         if vals.len() != f + m.policy.len() {
             return Err("bad Go model length".into());
         }
@@ -1116,6 +1201,19 @@ pub fn benchmark(
     seed: u64,
     heuristic: bool,
 ) -> Result<(usize, usize), String> {
+    benchmark_with_komi(model, games, seed, heuristic, 6.5)
+}
+
+pub fn benchmark_with_komi(
+    model: &GoModel,
+    games: usize,
+    seed: u64,
+    heuristic: bool,
+    komi: f32,
+) -> Result<(usize, usize), String> {
+    if !komi.is_finite() {
+        return Err("invalid Go komi".into());
+    }
     let mut rng = Rng::new(seed);
     let mut wins = 0;
     for g in 0..games {
@@ -1124,7 +1222,7 @@ pub fn benchmark(
         while !board.terminal() {
             let model_turn = (board.turn == 1) == model_black;
             let action = if model_turn {
-                model.choose(&board, &mut rng)
+                model.choose_with_komi(&board, &mut rng, komi)
             } else {
                 let legal = board.legal_moves();
                 if heuristic {
@@ -1135,7 +1233,7 @@ pub fn benchmark(
             };
             board.play(action)?;
         }
-        let black_win = board.score_black(6.5) > 0.0;
+        let black_win = board.score_black(komi) > 0.0;
         if black_win == model_black {
             wins += 1;
         }
@@ -1277,6 +1375,70 @@ mod tests {
         assert_eq!(loaded[0].komi.as_deref(), Some("6.5"));
         assert_eq!(legacy[0].first_turn, 1);
         assert!(legacy[0].black_setup.is_empty());
+    }
+
+    #[test]
+    fn komi_feature_is_normalized_and_relative_to_side_to_move() {
+        let mut board = GoBoard::new(5).unwrap();
+        assert_eq!(
+            board.features_with_komi(6.5).last().copied(),
+            Some(-6.5 / 25.0)
+        );
+        board.play(board.pass_action()).unwrap();
+        assert_eq!(
+            board.features_with_komi(6.5).last().copied(),
+            Some(6.5 / 25.0)
+        );
+    }
+
+    #[test]
+    fn game_validation_rejects_bad_winner_result_and_moves() {
+        let game = GoGame {
+            size: 5,
+            moves: vec![12],
+            winner: 1,
+            result: Some("W+R".into()),
+            komi: Some("6.5".into()),
+            first_turn: 1,
+            black_setup: Vec::new(),
+            white_setup: Vec::new(),
+        };
+        assert_eq!(
+            validate_game(&game),
+            Err("Go winner does not match recorded result".into())
+        );
+
+        let mut invalid_move = game;
+        invalid_move.result = None;
+        invalid_move.moves = vec![25, 25, 12];
+        assert!(validate_game(&invalid_move).is_err());
+    }
+
+    #[test]
+    fn model_checkpoint_roundtrips_and_loads_legacy_format() {
+        let path =
+            std::env::temp_dir().join(format!("neurofour-go-model-{}.ngo", std::process::id()));
+        let mut model = GoModel::new(5);
+        model.value[0] = 0.25;
+        let last_feature = model.value.len() - 1;
+        model.value[last_feature] = -0.5;
+        model.policy[0] = 0.75;
+        model.save(path.to_str().unwrap()).unwrap();
+        let loaded = GoModel::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.value, model.value);
+        assert_eq!(loaded.policy, model.policy);
+
+        let old_features = 5 * 5 * 2 + 1;
+        let old_policy_len = (5 * 5 + 1) * old_features;
+        let mut legacy = format!("NGO1 5\n");
+        legacy.push_str(&format!("{:.1}\n", 0.0).repeat(old_features + old_policy_len));
+        std::fs::write(&path, legacy).unwrap();
+        let legacy_model = GoModel::load(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(legacy_model.value.len(), old_features + 1);
+        assert_eq!(legacy_model.policy.len(), (5 * 5 + 1) * (old_features + 1));
+        assert!(legacy_model.value.iter().all(|weight| *weight == 0.0));
     }
 
     #[test]

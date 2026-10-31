@@ -13,7 +13,7 @@ use std::{collections::BTreeSet, fs::File, io::Write};
 use std::{env, process, time::Instant};
 
 fn usage() {
-    eprintln!("neurofour <command>\n  generate <file> [games] [seed]\n  import-uci <uci.csv> <native.csv>\n  import-pons <pons.json> <native.csv>\n  import-solver <solver-output> <native.csv>\n  import-zenodo <optimal.csv> <native.csv> [position_limit=100000]\n  merge <output.csv> <input.csv>...\n  mine-hard <checkpoint> <sequences.txt> [games=500] [seed=42] [min_ply=18]\n  train <data> <checkpoint> [max_epochs] [seed] [max_nodes] [top_k] [max_edges_per_node] [patience]\n  train-policy <zenodo.csv> <policy> [positions=100000] [epochs=3] [seed=42] [hard_analysis] [hard_repeat=1]\n  go-generate <size> <games> <file> [seed=42]\n  go-import-sgf <sgf-file-or-directory> <data.csv>\n  go-export-sgf <data.csv> <sgf-file>\n  go-train <data> <model> [epochs=2] [seed=42]\n  go-benchmark <model> [games=20] [seed=42]\n  eval <checkpoint> [opponent=random|heuristic|search] [games] [seed] [depth]\n  benchmark <checkpoint> [games] [seed]\n  benchmark-search <checkpoint> [model_depth=2] [games=100] [seed=42]\n  benchmark-hybrid <value> <policy> [depth=2] [policy_weight=.1] [games=100] [seed=42]\n  inspect <checkpoint>");
+    eprintln!("neurofour <command>\n  generate <file> [games] [seed]\n  import-uci <uci.csv> <native.csv>\n  import-pons <pons.json> <native.csv>\n  import-solver <solver-output> <native.csv>\n  import-zenodo <optimal.csv> <native.csv> [position_limit=100000]\n  merge <output.csv> <input.csv>...\n  mine-hard <checkpoint> <sequences.txt> [games=500] [seed=42] [min_ply=18]\n  train <data> <checkpoint> [max_epochs] [seed] [max_nodes] [top_k] [max_edges_per_node] [patience]\n  train-policy <zenodo.csv> <policy> [positions=100000] [epochs=3] [seed=42] [hard_analysis] [hard_repeat=1]\n  go-generate <size> <games> <file> [seed=42]\n  go-import-sgf <sgf-file-or-directory> <data.csv>\n  go-export-sgf <data.csv> <sgf-file>\n  go-train <data> <model> [epochs=2] [seed=42]\n  go-benchmark <model> [games=20] [seed=42] [komi=6.5]\n  eval <checkpoint> [opponent=random|heuristic|search] [games] [seed] [depth]\n  benchmark <checkpoint> [games] [seed]\n  benchmark-search <checkpoint> [model_depth=2] [games=100] [seed=42]\n  benchmark-hybrid <value> <policy> [depth=2] [policy_weight=.1] [games=100] [seed=42]\n  inspect <checkpoint>");
 }
 fn val<T: std::str::FromStr>(xs: &[String], i: usize, default: T) -> T {
     xs.get(i).and_then(|s| s.parse().ok()).unwrap_or(default)
@@ -263,10 +263,12 @@ fn run() -> Result<(), String> {
             let model = neurofour::go::GoModel::load(a.get(2).ok_or("missing Go model")?)?;
             let games = val(&a, 3, 20usize);
             let seed = val(&a, 4, 42u64);
+            let komi = val(&a, 5, 6.5f32);
             for heuristic in [false, true] {
                 let t = Instant::now();
-                let (w, l) = neurofour::go::benchmark(&model, games, seed, heuristic)?;
-                println!("go_size={} opponent={} games={games} W-L={w}-{l} win_rate={:.3} time_ms={} peak_ram_kb={}",model.size,if heuristic{"heuristic"}else{"random"},w as f64/games as f64,t.elapsed().as_millis(),memory_kb());
+                let (w, l) =
+                    neurofour::go::benchmark_with_komi(&model, games, seed, heuristic, komi)?;
+                println!("go_size={} opponent={} games={games} komi={komi} W-L={w}-{l} win_rate={:.3} time_ms={} peak_ram_kb={}",model.size,if heuristic{"heuristic"}else{"random"},w as f64/games as f64,t.elapsed().as_millis(),memory_kb());
             }
         }
         Some("eval") => {
