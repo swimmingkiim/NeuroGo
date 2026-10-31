@@ -591,6 +591,59 @@ cargo run --release -- go-benchmark-gtp-mcts \
   -override-config maxVisits=32,numSearchThreads=1,rules=chinese,ponderingEnabled=false
 ```
 
+### KataGo 교사 증류 준비
+
+KGS 기보에서 게임 단위로 train/validation을 나누고, 각 게임의 여러 ply를 KataGo analysis로 평가해 방문 분포 policy와 ownership을 TSV로 만드는 스크립트를 추가했습니다. 생성된 TSV는 `보드 크기`, `komi`, `공백 구분 수순`, `action:확률` 정책 분포, `쉼표 구분 ownership` 순서입니다. 아래 명령은 적격 게임 최대 400개, 게임당 4개 위치, 128 visits를 사용합니다.
+
+```bash
+python3 scripts/go/generate_katago_teacher.py \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  data/go/experiments/kgs-march-teacher-train.tsv \
+  data/go/experiments/kgs-march-teacher-validation.tsv \
+  --katago /path/to/katago --model /path/to/b6c64.txt.gz \
+  --config /path/to/analysis_example.cfg --visits 128 --seed 42 \
+  --games 400 --positions-per-game 4
+
+cargo run --release -- go-distill \
+  data/go/experiments/kgs-march-teacher-train.tsv \
+  data/go/experiments/kgs-march-teacher-validation.tsv \
+  checkpoints/go/kgs-march-katago-distilled.gns 5 42 128 8 16
+```
+
+증류 학습은 희소 뉴런의 시냅스와 policy/ownership 출력 head를 함께 갱신하고, validation policy cross-entropy와 ownership MSE를 저장 전에 출력합니다. 다만 캐시된 KataGo v1.18.1 b6c64 네트워크로 16 visits smoke test를 했을 때, 초기 위치와 180-ply 위치 모두 analysis 응답의 ownership 361개가 전부 0이었습니다. 두 게임·게임당 네 위치로 생성한 8개 샘플도 ownership nonzero가 0이었습니다. 따라서 이 데이터로 ownership 학습이나 성능 개선을 주장할 수 없으며, `go-distill`은 모든 ownership target이 0이면 잘못된 성공으로 처리하지 않고 중단합니다. 해당 head가 유효한 KataGo 모델로 교체한 뒤 증류를 진행해야 합니다. 현재 확인된 것은 policy/ownership TSV 경로와 policy 출력 학습의 smoke test뿐이며, 대규모 증류 및 바둑 승률 평가는 아직 수행하지 않았습니다.
+
+### 위치 기반 희소 trunk 실험
+
+`go-train`의 마지막 선택 인수 `spatial_radius`로 지역 희소 모델을 학습할 수 있습니다. 기본값 `0`은 이전 전역 연결 모델이며, 양수 `r`은 각 뉴런의 고정 anchor에서 체비쇼프 거리 `r` 안의 board feature만 입력 시냅스로 연결하고, policy/ownership 출력도 그 anchor 주변에만 연결합니다. 차례·komi 입력은 전역 입력으로 허용되고 value head는 전역 pooling을 유지합니다. 공간 모델의 뉴런은 보드에 고르게 초기 배치하고, 남은 용량은 데이터 기반 성장에 둡니다. 체크포인트 GNS5에 anchor와 반경을 저장하며 기존 GNS2–GNS4도 계속 읽습니다.
+
+```bash
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/kgs-march-spatial-r2.gns \
+  1 42 0.1 42 128 8 16 0.55 0.2 0.01 0 2
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/kgs-march-spatial-r4.gns \
+  1 42 0.1 42 128 8 16 0.55 0.2 0.01 0 4
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/kgs-march-spatial-r4-top16.gns \
+  1 42 0.1 42 128 16 16 0.55 0.2 0.01 0 4
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-march-spatial-r2.gns data/go/kgs-2019-04.csv
+```
+
+같은 KGS March 학습 게임·seed·1 epoch·고정 split을 사용하고, 독립 April 1,231판/232,601착수로 평가했습니다. 전역 baseline 체크포인트도 같은 평가 명령으로 재실행했습니다.
+
+| 구조 | 반경 | top-k | 학습 뉴런/시냅스 | 학습 시간 / peak RAM | April value MSE | April policy top-1 |
+|---|---:|---:|---:|---:|---:|---:|
+| 전역 baseline | 0 | 8 | 128 / 824 | 이전 실험 | `.987445` | `.011294` |
+| 공간 희소 | 2 | 8 | 128 / 668 | 212초 / 27 MiB | `.998833` | `.010464` |
+| 공간 희소 | 4 | 8 | 128 / 789 | 216초 / 27 MiB | `.993900` | `.011217` |
+| 공간 희소 | 4 | 16 | 128 / 897 | 347초 / 27 MiB | `.995131` | `.010443` |
+
+평가 모델 모두 무예측 value 기준 1.0 및 합법수 균등 policy 기준 `.004479`보다 나았지만, 이번 공간 모델은 두 지표 모두 전역 baseline을 넘지 못했습니다. 반경 4가 테스트한 지역 모델 중 가장 baseline에 가까웠고, top-k를 16으로 늘려도 개선되지 않았습니다. 따라서 현재 구현은 위치 기반 연결을 검증한 구조 실험이지 성능 개선 결과가 아니며, KataGo 대국도 수행하지 않았습니다. 공간별 독립 뉴런 가중치를 쓰기 때문에 기존 8방향 대칭 증강이 회전·반사에 대해 가중치를 공유하지 않는 점도 한계입니다.
+
 ```bash
 cargo run --release -- go-train \
   data/go/kgs-2019-03-04.csv checkpoints/go/kgs-2019-sparse.gns \
@@ -605,7 +658,7 @@ cargo run --release -- go-benchmark-gtp \
   -override-config maxVisits=32,numSearchThreads=1,rules=chinese,ponderingEnabled=false
 ```
 
-이하의 기존 구조 ablation 및 첫 sparse 재학습 결과는 활로 feature·대칭 증강·합법수 전체 softmax·MCTS를 추가하기 전 초기 모델을 대상으로 한 과거 기준선입니다. 현재 모델은 그룹 활로 feature와 정책 유도 MCTS를 갖지만, 지역 연결 기반 trunk, ownership/score 보조 head, self-play 강화학습은 아직 없습니다. 따라서 아래 예전 결과를 새 학습 모델의 수치와 혼합해 해석하지 않습니다.
+이하의 기존 구조 ablation 및 첫 sparse 재학습 결과는 활로 feature·대칭 증강·합법수 전체 softmax·MCTS를 추가하기 전 초기 모델을 대상으로 한 과거 기준선입니다. 현재 모델은 그룹 활로 feature, 정책 유도 MCTS, 실험용 지역 연결 trunk를 갖지만, 유효한 ownership 교사 신호, score 보조 학습, self-play 강화학습은 아직 없습니다. 공간 trunk 수치를 아래 과거 결과와 혼합해 해석하지 않습니다.
 
 첫 19×19 재학습은 KGS 2019 2,681판을 게임 단위 2,413/268 train/validation으로 나눠 seed 42, 최대 3 epoch 수행했습니다. epoch 3이 선택됐고, 128개 뉴런·739개 입력 시냅스(top-k 8)로 validation value MSE `.985466`을 기록했습니다(초기 무예측 기준 1.000000, 학습+검증 선택 약 65.8초, peak RAM 약 14.6 MiB). value는 개선됐지만 차이는 작습니다.
 

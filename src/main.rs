@@ -27,7 +27,8 @@ fn usage() {
         "  go-generate <size> <games> <file> [seed=42]\n",
         "  go-import-sgf <sgf-file-or-directory> <data.csv> [skip_invalid=false]\n",
         "  go-export-sgf <data.csv> <sgf-file>\n",
-        "  go-train <data> <model.gns> [epochs=2] [seed=42] [validation_fraction=0.1] [split_seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [error_threshold=0.55] [novelty=0.2] [prune_strength=0.01] [growth_rule=0|1]\n",
+        "  go-train <data> <model.gns> [epochs=2] [seed=42] [validation_fraction=0.1] [split_seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [error_threshold=0.55] [novelty=0.2] [prune_strength=0.01] [growth_rule=0|1] [spatial_radius=0]\n",
+        "  go-distill <teacher-train.tsv> <teacher-validation.tsv> <model.gns> [epochs=5] [seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [spatial_radius=0]\n",
         "  go-evaluate <model> <data.csv>\n",
         "  go-benchmark <model> [games=20] [seed=42] [komi=6.5]\n",
         "  go-benchmark-mcts <model> <games> <seed> <komi> <simulations> [cpuct=1.4] [opponent=heuristic|random]\n",
@@ -320,6 +321,8 @@ fn run() -> Result<(), String> {
                 parse_optional(&a, 13, "prune_strength")?.unwrap_or(config.prune_strength);
             config.growth_rule =
                 parse_optional(&a, 14, "growth_rule")?.unwrap_or(config.growth_rule);
+            config.spatial_radius =
+                parse_optional(&a, 15, "spatial_radius")?.unwrap_or(config.spatial_radius);
             let games = neurofour::go::load_games(data)?;
             let size = games.first().ok_or("empty Go data")?.size;
             let (training_games, validation_games) =
@@ -359,7 +362,65 @@ fn run() -> Result<(), String> {
             let best_epoch = best_epoch
                 .map(|epoch| epoch.to_string())
                 .unwrap_or_else(|| "disabled".into());
-            println!("trained_go architecture=dynamic_sparse size={size} nodes={} edges={} top_k={} max_nodes={} max_edges_per_node={} error_threshold={} novelty_threshold={} prune_strength={} growth_rule={} training_symmetries=8 policy_objective=legal_softmax early_stopping=policy_value_objective train_games={} validation_games={} epochs={epochs} best_epoch={best_epoch} train_loss={loss:.6} validation_baseline_loss={validation_baseline} validation_loss={validation_loss} validation_moves={validation_moves} time_ms={} peak_ram_kb={} file={output}",model.nodes.len(),model.edge_count(),model.cfg.top_k,model.cfg.max_nodes,model.cfg.max_edges_per_node,model.cfg.error_threshold,model.cfg.novelty_threshold,model.cfg.prune_strength,model.cfg.growth_rule,training_games.len(),validation_games.len(),t.elapsed().as_millis(),memory_kb());
+            println!("trained_go architecture=dynamic_sparse size={size} nodes={} edges={} top_k={} max_nodes={} max_edges_per_node={} error_threshold={} novelty_threshold={} prune_strength={} growth_rule={} spatial_radius={} training_symmetries=8 policy_objective=legal_softmax early_stopping=policy_value_objective train_games={} validation_games={} epochs={epochs} best_epoch={best_epoch} train_loss={loss:.6} validation_baseline_loss={validation_baseline} validation_loss={validation_loss} validation_moves={validation_moves} time_ms={} peak_ram_kb={} file={output}",model.nodes.len(),model.edge_count(),model.cfg.top_k,model.cfg.max_nodes,model.cfg.max_edges_per_node,model.cfg.error_threshold,model.cfg.novelty_threshold,model.cfg.prune_strength,model.cfg.growth_rule,model.cfg.spatial_radius,training_games.len(),validation_games.len(),t.elapsed().as_millis(),memory_kb());
+        }
+        Some("go-distill") => {
+            let training_path = a.get(2).ok_or("missing teacher training dataset")?;
+            let validation_path = a.get(3).ok_or("missing teacher validation dataset")?;
+            let output = a.get(4).ok_or("missing Go model output")?;
+            let epochs = val(&a, 5, 5usize);
+            let seed = val(&a, 6, 42u64);
+            let training = neurofour::go::load_teacher_positions(training_path)?;
+            let validation = neurofour::go::load_teacher_positions(validation_path)?;
+            let size = training
+                .first()
+                .ok_or("empty teacher training dataset")?
+                .size;
+            if training.iter().any(|position| position.size != size)
+                || validation.iter().any(|position| position.size != size)
+            {
+                return Err("teacher training and validation sets must use one board size".into());
+            }
+            let has_ownership_targets = |positions: &[neurofour::go::GoTeacherPosition]| {
+                positions
+                    .iter()
+                    .flat_map(|position| &position.ownership)
+                    .any(|&value| value != 0.0)
+            };
+            if !has_ownership_targets(&training) {
+                return Err(
+                    "teacher training ownership targets are all zero; verify the KataGo model supports ownership output"
+                        .into(),
+                );
+            }
+            if !has_ownership_targets(&validation) {
+                return Err("teacher validation ownership targets are all zero".into());
+            }
+            let mut config = neurofour::go::GoSparseConfig::default();
+            config.max_nodes = parse_optional(&a, 7, "max_nodes")?.unwrap_or(config.max_nodes);
+            config.top_k = parse_optional(&a, 8, "top_k")?.unwrap_or(config.top_k);
+            config.max_edges_per_node =
+                parse_optional(&a, 9, "max_edges")?.unwrap_or(config.max_edges_per_node);
+            config.spatial_radius =
+                parse_optional(&a, 10, "spatial_radius")?.unwrap_or(config.spatial_radius);
+            let mut model = neurofour::go::GoSparseModel::new(size, config, seed)?;
+            let baseline = model.evaluate_teacher_metrics(&validation)?;
+            let t = Instant::now();
+            let (training_policy_loss, training_ownership_mse) =
+                model.train_teacher(&training, epochs, seed)?;
+            let (validation_policy_loss, validation_ownership_mse) =
+                model.evaluate_teacher_metrics(&validation)?;
+            model.save(output)?;
+            println!(
+                "go_distill board_size={size} train_positions={} validation_positions={} epochs={epochs} seed={seed} nodes={} edges={} train_policy_ce={training_policy_loss:.6} train_ownership_mse={training_ownership_mse:.6} validation_policy_ce_before={:.6} validation_policy_ce={validation_policy_loss:.6} validation_ownership_mse_before={:.6} validation_ownership_mse={validation_ownership_mse:.6} elapsed_ms={} model={output}",
+                training.len(),
+                validation.len(),
+                model.nodes.len(),
+                model.edge_count(),
+                baseline.0,
+                baseline.1,
+                t.elapsed().as_millis(),
+            );
         }
         Some("go-evaluate") => {
             let model = neurofour::go::GoSparseModel::load(a.get(2).ok_or("missing Go model")?)?;

@@ -419,6 +419,117 @@ pub struct GoGame {
     pub white_setup: Vec<usize>,
 }
 
+#[derive(Clone, Debug)]
+pub struct GoTeacherPosition {
+    pub size: usize,
+    pub komi: f32,
+    pub moves: Vec<usize>,
+    pub policy: Vec<(usize, f32)>,
+    pub ownership: Vec<f32>,
+}
+
+pub fn load_teacher_positions(path: &str) -> Result<Vec<GoTeacherPosition>, String> {
+    let mut positions = Vec::new();
+    for (line_index, line) in BufReader::new(File::open(path).map_err(|error| error.to_string())?)
+        .lines()
+        .enumerate()
+    {
+        let line = line.map_err(|error| error.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() != 5 {
+            return Err(format!("invalid teacher row at line {}", line_index + 1));
+        }
+        let size = fields[0]
+            .parse::<usize>()
+            .map_err(|_| format!("invalid teacher board size at line {}", line_index + 1))?;
+        if !(5..=19).contains(&size) {
+            return Err(format!(
+                "invalid teacher board size at line {}",
+                line_index + 1
+            ));
+        }
+        let komi = fields[1]
+            .parse::<f32>()
+            .map_err(|_| format!("invalid teacher komi at line {}", line_index + 1))?;
+        if !komi.is_finite() {
+            return Err(format!("invalid teacher komi at line {}", line_index + 1));
+        }
+        let moves = fields[2]
+            .split_whitespace()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid teacher history at line {}", line_index + 1))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let policy = fields[3]
+            .split(',')
+            .map(|entry| {
+                let (action, probability) = entry
+                    .split_once(':')
+                    .ok_or_else(|| format!("invalid teacher policy at line {}", line_index + 1))?;
+                let action = action.parse::<usize>().map_err(|_| {
+                    format!("invalid teacher policy action at line {}", line_index + 1)
+                })?;
+                let probability = probability.parse::<f32>().map_err(|_| {
+                    format!(
+                        "invalid teacher policy probability at line {}",
+                        line_index + 1
+                    )
+                })?;
+                if action > size * size || !probability.is_finite() || probability < 0.0 {
+                    return Err(format!("invalid teacher policy at line {}", line_index + 1));
+                }
+                Ok((action, probability))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if policy.is_empty()
+            || policy
+                .iter()
+                .map(|(_, probability)| probability)
+                .sum::<f32>()
+                <= 0.0
+        {
+            return Err(format!("empty teacher policy at line {}", line_index + 1));
+        }
+        let ownership = fields[4]
+            .split(',')
+            .map(|value| {
+                let value = value
+                    .parse::<f32>()
+                    .map_err(|_| format!("invalid teacher ownership at line {}", line_index + 1))?;
+                if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+                    return Err(format!(
+                        "invalid teacher ownership at line {}",
+                        line_index + 1
+                    ));
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if ownership.len() != size * size {
+            return Err(format!(
+                "invalid teacher ownership size at line {}",
+                line_index + 1
+            ));
+        }
+        positions.push(GoTeacherPosition {
+            size,
+            komi,
+            moves,
+            policy,
+            ownership,
+        });
+    }
+    if positions.is_empty() {
+        return Err("teacher dataset contains no positions".into());
+    }
+    Ok(positions)
+}
+
 impl GoGame {
     pub fn komi_value(&self) -> Result<f32, String> {
         let komi = match &self.komi {
@@ -1207,6 +1318,7 @@ pub struct GoSparseEdge {
 
 #[derive(Clone, Debug)]
 pub struct GoSparseNode {
+    pub anchor: usize,
     pub bias: f32,
     pub utility: f32,
     pub dormant: bool,
@@ -1226,6 +1338,7 @@ pub struct GoSparseConfig {
     pub prune_strength: f32,
     pub dormancy_steps: u64,
     pub growth_rule: u8,
+    pub spatial_radius: usize,
 }
 
 impl Default for GoSparseConfig {
@@ -1242,6 +1355,7 @@ impl Default for GoSparseConfig {
             prune_strength: 0.01,
             dormancy_steps: 20_000,
             growth_rule: 0,
+            spatial_radius: 0,
         }
     }
 }
@@ -1253,6 +1367,8 @@ pub struct GoSparseModel {
     pub nodes: Vec<GoSparseNode>,
     pub value_weights: Vec<f32>,
     pub policy_weights: Vec<f32>,
+    pub ownership_weights: Vec<f32>,
+    pub ownership_biases: Vec<f32>,
     pub step: u64,
 }
 
@@ -1323,44 +1439,117 @@ impl GoSparseModel {
             || !cfg.prune_strength.is_finite()
             || cfg.prune_strength < 0.0
             || cfg.growth_rule > 1
+            || cfg.spatial_radius >= size
         {
             return Err("invalid Go sparse model configuration".into());
         }
         let mut rng = Rng::new(seed);
         let points = size * size;
-        let mut inputs: Vec<_> = (0..points * 2).collect();
-        rng.shuffle(&mut inputs);
-        let nodes = inputs
-            .into_iter()
-            .take(cfg.top_k)
-            .map(|input| GoSparseNode {
-                bias: 0.0,
-                utility: 0.1,
-                dormant: false,
-                edges: vec![
-                    GoSparseEdge {
-                        input: (points * 2) as u16,
-                        weight: rng.f32() * 0.2 - 0.1,
-                        strength: 0.1,
-                        last_active: 0,
-                    },
-                    GoSparseEdge {
-                        input: input as u16,
-                        weight: rng.f32() * 0.2 - 0.1,
-                        strength: 0.1,
-                        last_active: 0,
-                    },
-                ],
-            })
-            .collect();
+        let nodes = if cfg.spatial_radius == 0 {
+            let mut inputs: Vec<_> = (0..points * 2).collect();
+            rng.shuffle(&mut inputs);
+            inputs
+                .into_iter()
+                .take(cfg.top_k)
+                .map(|input| {
+                    Self::new_sparse_node(
+                        Self::input_point(size, input).unwrap(),
+                        input,
+                        points,
+                        &mut rng,
+                    )
+                })
+                .collect()
+        } else {
+            let node_count = cfg.max_nodes.div_ceil(2).max(cfg.top_k).min(points);
+            (0..node_count)
+                .map(|node_index| {
+                    let anchor = node_index * points / node_count;
+                    let input = rng.usize(2) * points + anchor;
+                    Self::new_sparse_node(anchor, input, points, &mut rng)
+                })
+                .collect()
+        };
         Ok(Self {
             size,
             value_weights: vec![0.0; cfg.max_nodes],
             policy_weights: vec![0.0; (size * size + 1) * cfg.max_nodes],
+            ownership_weights: vec![0.0; size * size * cfg.max_nodes],
+            ownership_biases: vec![0.0; size * size],
             cfg,
             nodes,
             step: 0,
         })
+    }
+
+    fn new_sparse_node(anchor: usize, input: usize, points: usize, rng: &mut Rng) -> GoSparseNode {
+        GoSparseNode {
+            anchor,
+            bias: 0.0,
+            utility: 0.1,
+            dormant: false,
+            edges: vec![
+                GoSparseEdge {
+                    input: (points * 2) as u16,
+                    weight: rng.f32() * 0.2 - 0.1,
+                    strength: 0.1,
+                    last_active: 0,
+                },
+                GoSparseEdge {
+                    input: input as u16,
+                    weight: rng.f32() * 0.2 - 0.1,
+                    strength: 0.1,
+                    last_active: 0,
+                },
+            ],
+        }
+    }
+
+    fn within_spatial_radius(&self, first: usize, second: usize) -> bool {
+        if self.cfg.spatial_radius == 0 {
+            return true;
+        }
+        let first_x = first % self.size;
+        let first_y = first / self.size;
+        let second_x = second % self.size;
+        let second_y = second / self.size;
+        first_x.abs_diff(second_x) <= self.cfg.spatial_radius
+            && first_y.abs_diff(second_y) <= self.cfg.spatial_radius
+    }
+
+    fn input_is_local(&self, anchor: usize, input: usize) -> bool {
+        let points = self.size * self.size;
+        let input_features = points * 8 + 2;
+        if input >= input_features {
+            return false;
+        }
+        if input == points * 2 || input == points * 2 + 1 {
+            return true;
+        }
+        Self::input_point(self.size, input)
+            .is_some_and(|point| self.within_spatial_radius(anchor, point))
+    }
+
+    fn input_point(size: usize, input: usize) -> Option<usize> {
+        let points = size * size;
+        if input < points * 2 {
+            Some(input % points)
+        } else if input < points * 2 + 2 || input >= points * 8 + 2 {
+            None
+        } else {
+            Some((input - (points * 2 + 2)) % points)
+        }
+    }
+
+    fn node_connects_to_action(&self, node_index: usize, action: usize) -> bool {
+        action == self.size * self.size
+            || self.cfg.spatial_radius == 0
+            || self.within_spatial_radius(self.nodes[node_index].anchor, action)
+    }
+
+    fn node_connects_to_point(&self, node_index: usize, point: usize) -> bool {
+        self.cfg.spatial_radius == 0
+            || self.within_spatial_radius(self.nodes[node_index].anchor, point)
     }
 
     fn activations(&self, board: &GoBoard, komi: f32) -> Vec<(usize, f32, f32)> {
@@ -1413,6 +1602,7 @@ impl GoSparseModel {
         let start = action * self.cfg.max_nodes;
         active
             .iter()
+            .filter(|(index, _, _)| self.node_connects_to_action(*index, action))
             .map(|(index, activation, _)| self.policy_weights[start + index] * activation)
             .sum()
     }
@@ -1432,6 +1622,211 @@ impl GoSparseModel {
             *probability /= normalizer;
         }
         probabilities
+    }
+
+    fn ownership_from_activations(&self, active: &[(usize, f32, f32)]) -> Vec<f32> {
+        (0..self.size * self.size)
+            .map(|point| {
+                let start = point * self.cfg.max_nodes;
+                (self.ownership_biases[point]
+                    + active
+                        .iter()
+                        .filter(|(index, _, _)| self.node_connects_to_point(*index, point))
+                        .map(|(index, activation, _)| {
+                            self.ownership_weights[start + index] * activation
+                        })
+                        .sum::<f32>())
+                .tanh()
+            })
+            .collect()
+    }
+
+    pub fn evaluate_teacher_ownership(
+        &self,
+        positions: &[GoTeacherPosition],
+    ) -> Result<f32, String> {
+        self.evaluate_teacher_metrics(positions)
+            .map(|(_, ownership_mse)| ownership_mse)
+    }
+
+    pub fn evaluate_teacher_metrics(
+        &self,
+        positions: &[GoTeacherPosition],
+    ) -> Result<(f32, f32), String> {
+        let mut policy_loss = 0.0;
+        let mut ownership_squared_error = 0.0;
+        let mut policy_positions = 0usize;
+        let mut ownership_points = 0usize;
+        for position in positions
+            .iter()
+            .filter(|position| position.size == self.size)
+        {
+            let mut board = GoBoard::new(self.size)?;
+            for &action in &position.moves {
+                board.play(action)?;
+            }
+            let active = self.activations(&board, position.komi);
+            let legal = board.legal_moves();
+            let probabilities = self.policy_probabilities(&legal, &active);
+            let mut targets = vec![0.0f32; self.size * self.size + 1];
+            let target_sum: f32 = position
+                .policy
+                .iter()
+                .map(|(_, probability)| *probability)
+                .sum();
+            if target_sum <= 0.0 || !target_sum.is_finite() {
+                return Err("teacher policy has invalid probability mass".into());
+            }
+            for &(action, probability) in &position.policy {
+                if !legal.contains(&action) {
+                    return Err("teacher policy contains an illegal move".into());
+                }
+                targets[action] += probability / target_sum;
+            }
+            for (index, &action) in legal.iter().enumerate() {
+                if targets[action] > 0.0 {
+                    policy_loss -=
+                        targets[action] * probabilities[index].max(f32::MIN_POSITIVE).ln();
+                }
+            }
+            policy_positions += 1;
+            let predicted_ownership = self.ownership_from_activations(&active);
+            for (prediction, target) in predicted_ownership.iter().zip(&position.ownership) {
+                ownership_squared_error += (target - prediction).powi(2);
+                ownership_points += 1;
+            }
+        }
+        if policy_positions == 0 || ownership_points == 0 {
+            return Err("teacher evaluation set contains no matching Go positions".into());
+        }
+        Ok((
+            policy_loss / policy_positions as f32,
+            ownership_squared_error / ownership_points as f32,
+        ))
+    }
+
+    pub fn train_teacher(
+        &mut self,
+        positions: &[GoTeacherPosition],
+        epochs: usize,
+        seed: u64,
+    ) -> Result<(f32, f32), String> {
+        let training: Vec<_> = positions
+            .iter()
+            .filter(|position| position.size == self.size)
+            .collect();
+        if training.is_empty() || epochs == 0 {
+            return Err("teacher training requires matching positions and positive epochs".into());
+        }
+        let mut rng = Rng::new(seed);
+        let mut policy_loss = 0.0;
+        for _ in 0..epochs {
+            let mut order: Vec<_> = (0..training.len()).collect();
+            rng.shuffle(&mut order);
+            let mut loss_sum = 0.0;
+            for position_index in order {
+                let position = training[position_index];
+                let mut board = GoBoard::new(self.size)?;
+                for &action in &position.moves {
+                    board.play(action)?;
+                }
+                let features = board.features_with_komi(position.komi);
+                let active = self.activations_from_features(&features);
+                let legal = board.legal_moves();
+                let mut targets = vec![0.0f32; self.size * self.size + 1];
+                let mut target_sum = 0.0f32;
+                for &(action, probability) in &position.policy {
+                    if !legal.contains(&action) {
+                        return Err("teacher policy contains an illegal move".into());
+                    }
+                    targets[action] += probability;
+                    target_sum += probability;
+                }
+                if !target_sum.is_finite() || target_sum <= 0.0 {
+                    return Err("teacher policy has invalid probability mass".into());
+                }
+                for target in &mut targets {
+                    *target /= target_sum;
+                }
+                let probabilities = self.policy_probabilities(&legal, &active);
+                let policy_directions: Vec<_> = legal
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &action)| (action, targets[action] - probabilities[index]))
+                    .collect();
+                let ownership_predictions = self.ownership_from_activations(&active);
+                let hidden_deltas: Vec<_> = active
+                    .iter()
+                    .map(|&(index, _, derivative)| {
+                        let policy_delta = policy_directions
+                            .iter()
+                            .map(|(action, direction)| {
+                                direction * self.policy_weights[action * self.cfg.max_nodes + index]
+                            })
+                            .sum::<f32>();
+                        let ownership_delta = (0..self.size * self.size)
+                            .map(|point| {
+                                if !self.node_connects_to_point(index, point) {
+                                    return 0.0;
+                                }
+                                let prediction = ownership_predictions[point];
+                                let error = position.ownership[point] - prediction;
+                                let output_gradient = error * (1.0 - prediction * prediction);
+                                output_gradient
+                                    * self.ownership_weights[point * self.cfg.max_nodes + index]
+                            })
+                            .sum::<f32>()
+                            / (self.size * self.size) as f32;
+                        (index, (policy_delta + ownership_delta) * derivative)
+                    })
+                    .collect();
+                for &(index, activation, _) in &active {
+                    for &(action, direction) in &policy_directions {
+                        if !self.node_connects_to_action(index, action) {
+                            continue;
+                        }
+                        let weight_index = action * self.cfg.max_nodes + index;
+                        self.policy_weights[weight_index] +=
+                            self.cfg.policy_learning_rate * direction * activation;
+                    }
+                }
+                for (index, &action) in legal.iter().enumerate() {
+                    if targets[action] > 0.0 {
+                        loss_sum -=
+                            targets[action] * probabilities[index].max(f32::MIN_POSITIVE).ln();
+                    }
+                }
+                for point in 0..self.size * self.size {
+                    let prediction = ownership_predictions[point];
+                    let error = position.ownership[point] - prediction;
+                    let output_gradient = error * (1.0 - prediction * prediction);
+                    self.ownership_biases[point] += 0.001 * output_gradient;
+                    let start = point * self.cfg.max_nodes;
+                    for &(index, activation, _) in &active {
+                        if !self.node_connects_to_point(index, point) {
+                            continue;
+                        }
+                        self.ownership_weights[start + index] +=
+                            0.001 * output_gradient * activation;
+                    }
+                }
+                for (index, gradient) in hidden_deltas {
+                    self.nodes[index].bias += self.cfg.learning_rate * gradient;
+                    for edge in &mut self.nodes[index].edges {
+                        let input = features[edge.input as usize];
+                        if input != 0.0 {
+                            edge.weight += self.cfg.learning_rate * gradient * input;
+                            edge.strength = edge.strength * 0.99 + (gradient * input).abs() * 0.01;
+                            edge.last_active = self.step + 1;
+                        }
+                    }
+                }
+                self.step += 1;
+            }
+            policy_loss = loss_sum / training.len() as f32;
+        }
+        let ownership_mse = self.evaluate_teacher_ownership(positions)?;
+        Ok((policy_loss, ownership_mse))
     }
 
     fn select_growth_input(&self, candidates: &[usize], rng: &mut Rng) -> usize {
@@ -1662,6 +2057,9 @@ impl GoSparseModel {
             let policy_delta = policy_directions
                 .iter()
                 .map(|(candidate, direction)| {
+                    if !self.node_connects_to_action(index, *candidate) {
+                        return 0.0;
+                    }
                     direction * self.policy_weights[candidate * self.cfg.max_nodes + index]
                 })
                 .sum::<f32>();
@@ -1676,6 +2074,9 @@ impl GoSparseModel {
         for &(index, activation, _) in &active {
             self.value_weights[index] += value_learning_rate * value_delta * activation;
             for &(candidate, direction) in &policy_directions {
+                if !self.node_connects_to_action(index, candidate) {
+                    continue;
+                }
                 self.policy_weights[candidate * self.cfg.max_nodes + index] +=
                     policy_learning_rate * direction * activation;
             }
@@ -1695,10 +2096,11 @@ impl GoSparseModel {
                     .iter()
                     .copied()
                     .filter(|input| {
-                        !self.nodes[index]
-                            .edges
-                            .iter()
-                            .any(|edge| edge.input as usize == *input)
+                        self.input_is_local(self.nodes[index].anchor, *input)
+                            && !self.nodes[index]
+                                .edges
+                                .iter()
+                                .any(|edge| edge.input as usize == *input)
                     })
                     .collect();
                 if missing.is_empty() {
@@ -1755,7 +2157,10 @@ impl GoSparseModel {
                 return Ok(value_error * value_error + policy_loss);
             }
             let input = self.select_growth_input(&active_inputs, rng);
+            let points = self.size * self.size;
+            let anchor = Self::input_point(self.size, input).unwrap_or_else(|| rng.usize(points));
             let new_node = GoSparseNode {
+                anchor,
                 bias: 0.0,
                 utility: model_error * 0.1,
                 dormant: false,
@@ -1999,7 +2404,7 @@ impl GoSparseModel {
         let mut writer = BufWriter::new(File::create(path).map_err(|error| error.to_string())?);
         writeln!(
             writer,
-            "GNS3 {} {} {} {} {} {} {} {} {} {} {} {} {}",
+            "GNS5 {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
             self.size,
             self.step,
             self.cfg.max_nodes,
@@ -2012,14 +2417,15 @@ impl GoSparseModel {
             self.cfg.error_threshold,
             self.cfg.prune_strength,
             self.cfg.dormancy_steps,
-            self.cfg.growth_rule
+            self.cfg.growth_rule,
+            self.cfg.spatial_radius
         )
         .map_err(|error| error.to_string())?;
         for node in &self.nodes {
             write!(
                 writer,
-                "N {} {} {}",
-                node.bias, node.utility, node.dormant as u8
+                "N {} {} {} {}",
+                node.anchor, node.bias, node.utility, node.dormant as u8
             )
             .map_err(|error| error.to_string())?;
             for edge in &node.edges {
@@ -2055,6 +2461,20 @@ impl GoSparseModel {
             )
             .map_err(|error| error.to_string())?;
         }
+        for point in 0..self.size * self.size {
+            let start = point * self.cfg.max_nodes;
+            writeln!(
+                writer,
+                "O {point} {} {}",
+                self.ownership_biases[point],
+                self.ownership_weights[start..start + self.cfg.max_nodes]
+                    .iter()
+                    .map(f32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+            .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
@@ -2068,10 +2488,10 @@ impl GoSparseModel {
         let fields: Vec<_> = header.split_whitespace().collect();
         if !matches!(
             (fields.first().copied(), fields.len()),
-            (Some("GNS2"), 13) | (Some("GNS3"), 14)
+            (Some("GNS2"), 13) | (Some("GNS3"), 14) | (Some("GNS4"), 14) | (Some("GNS5"), 15)
         ) {
             return Err(
-                "unsupported Go checkpoint; train the Go sparse model to create GNS3".into(),
+                "unsupported Go checkpoint; train the Go sparse model to create GNS5".into(),
             );
         }
         let parse_usize = |index: usize| {
@@ -2101,10 +2521,19 @@ impl GoSparseModel {
             dormancy_steps: fields[12]
                 .parse::<u64>()
                 .map_err(|_| "invalid Go sparse checkpoint")?,
-            growth_rule: if fields[0] == "GNS3" {
+            growth_rule: if fields[0] == "GNS3" || fields[0] == "GNS4" {
                 fields[13]
                     .parse::<u8>()
                     .map_err(|_| "invalid Go sparse growth rule")?
+            } else if fields[0] == "GNS5" {
+                fields[13]
+                    .parse::<u8>()
+                    .map_err(|_| "invalid Go sparse growth rule")?
+            } else {
+                0
+            },
+            spatial_radius: if fields[0] == "GNS5" {
+                parse_usize(14)?
             } else {
                 0
             },
@@ -2115,26 +2544,42 @@ impl GoSparseModel {
             || cfg.top_k == 0
             || cfg.top_k > cfg.max_nodes
             || cfg.growth_rule > 1
+            || cfg.spatial_radius >= size
         {
             return Err("invalid Go sparse checkpoint dimensions".into());
         }
+        let max_nodes = cfg.max_nodes;
         let mut model = Self {
             size,
-            value_weights: vec![0.0; cfg.max_nodes],
-            policy_weights: vec![0.0; (size * size + 1) * cfg.max_nodes],
+            value_weights: vec![0.0; max_nodes],
+            policy_weights: vec![0.0; (size * size + 1) * max_nodes],
             cfg,
             nodes: Vec::new(),
+            ownership_weights: vec![0.0; size * size * max_nodes],
+            ownership_biases: vec![0.0; size * size],
             step,
         };
         let mut value_seen = false;
         let mut policy_seen = vec![false; size * size + 1];
+        let mut ownership_seen = vec![false; size * size];
         for line in lines {
             let line = line.map_err(|error| error.to_string())?;
             let parts: Vec<_> = line.split_whitespace().collect();
             match parts.first().copied() {
-                Some("N") if parts.len() >= 4 => {
+                Some("N") if parts.len() >= if fields[0] == "GNS5" { 5 } else { 4 } => {
+                    let edge_start = if fields[0] == "GNS5" { 5 } else { 4 };
+                    let anchor = if fields[0] == "GNS5" {
+                        parts[1]
+                            .parse::<usize>()
+                            .map_err(|_| "invalid Go sparse checkpoint neuron anchor")?
+                    } else {
+                        model.nodes.len() % (size * size)
+                    };
+                    if anchor >= size * size {
+                        return Err("Go sparse checkpoint neuron anchor is out of range".into());
+                    }
                     let mut edges = Vec::new();
-                    for part in &parts[4..] {
+                    for part in &parts[edge_start..] {
                         let edge: Vec<_> = part.split(':').collect();
                         if edge.len() != 4 {
                             return Err("invalid Go sparse checkpoint edge".into());
@@ -2144,6 +2589,11 @@ impl GoSparseModel {
                             .map_err(|_| "invalid Go sparse checkpoint edge")?;
                         if input >= size * size * 8 + 2 {
                             return Err("Go sparse checkpoint edge is out of range".into());
+                        }
+                        if !model.input_is_local(anchor, input) {
+                            return Err(
+                                "Go sparse checkpoint edge exceeds its spatial radius".into()
+                            );
                         }
                         edges.push(GoSparseEdge {
                             input: input as u16,
@@ -2159,13 +2609,14 @@ impl GoSparseModel {
                         });
                     }
                     model.nodes.push(GoSparseNode {
-                        bias: parts[1]
+                        anchor,
+                        bias: parts[if fields[0] == "GNS5" { 2 } else { 1 }]
                             .parse()
                             .map_err(|_| "invalid Go sparse checkpoint node")?,
-                        utility: parts[2]
+                        utility: parts[if fields[0] == "GNS5" { 3 } else { 2 }]
                             .parse()
                             .map_err(|_| "invalid Go sparse checkpoint node")?,
-                        dormant: parts[3] == "1",
+                        dormant: parts[if fields[0] == "GNS5" { 4 } else { 3 }] == "1",
                         edges,
                     });
                 }
@@ -2195,10 +2646,41 @@ impl GoSparseModel {
                     }
                     policy_seen[action] = true;
                 }
+                Some("O")
+                    if matches!(fields[0], "GNS4" | "GNS5")
+                        && parts.len() == model.cfg.max_nodes + 3 =>
+                {
+                    let point = parts[1]
+                        .parse::<usize>()
+                        .map_err(|_| "invalid Go sparse checkpoint ownership head")?;
+                    if point >= ownership_seen.len() || ownership_seen[point] {
+                        return Err("invalid Go sparse checkpoint ownership point".into());
+                    }
+                    model.ownership_biases[point] = parts[2]
+                        .parse()
+                        .map_err(|_| "invalid Go sparse checkpoint ownership head")?;
+                    let start = point * model.cfg.max_nodes;
+                    for (weight, value) in model.ownership_weights
+                        [start..start + model.cfg.max_nodes]
+                        .iter_mut()
+                        .zip(&parts[3..])
+                    {
+                        *weight = value
+                            .parse()
+                            .map_err(|_| "invalid Go sparse checkpoint ownership head")?;
+                    }
+                    ownership_seen[point] = true;
+                }
                 _ => return Err("invalid Go sparse checkpoint record".into()),
             }
         }
-        if model.nodes.len() > model.cfg.max_nodes || !value_seen || policy_seen.contains(&false) {
+        let missing_ownership =
+            matches!(fields[0], "GNS4" | "GNS5") && ownership_seen.contains(&false);
+        if model.nodes.len() > model.cfg.max_nodes
+            || !value_seen
+            || policy_seen.contains(&false)
+            || missing_ownership
+        {
             return Err("incomplete Go sparse checkpoint".into());
         }
         Ok(model)
@@ -2976,6 +3458,57 @@ mod tests {
             std::env::temp_dir().join(format!("neurofour-go-sparse-{}.gns", std::process::id()));
         model.save(path.to_str().unwrap()).unwrap();
         let loaded = GoSparseModel::load(path.to_str().unwrap()).unwrap();
+        let serialized = std::fs::read_to_string(&path).unwrap();
+        let legacy_gns4: Vec<_> = serialized
+            .lines()
+            .map(|line| {
+                if line.starts_with("GNS5 ") {
+                    let header: Vec<_> = line.split_whitespace().collect();
+                    format!("GNS4 {}", header[1..14].join(" "))
+                } else if line.starts_with("N ") {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    format!("N {}", fields[2..].join(" "))
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect();
+        let legacy_v4 =
+            std::env::temp_dir().join(format!("neurofour-go-sparse-v4-{}.gns", std::process::id()));
+        std::fs::write(&legacy_v4, legacy_gns4.join("\n")).unwrap();
+        let loaded_v4 = GoSparseModel::load(legacy_v4.to_str().unwrap()).unwrap();
+        assert_eq!(loaded_v4.cfg.spatial_radius, 0);
+        assert_eq!(loaded_v4.ownership_weights, model.ownership_weights);
+        std::fs::remove_file(legacy_v4).unwrap();
+        let mut legacy_lines: Vec<_> = legacy_gns4
+            .iter()
+            .filter(|line| !line.starts_with("O "))
+            .cloned()
+            .collect();
+        let header: Vec<_> = legacy_lines[0].split_whitespace().collect();
+        let legacy_v3 =
+            std::env::temp_dir().join(format!("neurofour-go-sparse-v3-{}.gns", std::process::id()));
+        legacy_lines[0] = format!("GNS3 {}", header[1..].join(" "));
+        std::fs::write(&legacy_v3, legacy_lines.join("\n")).unwrap();
+        let loaded_v3 = GoSparseModel::load(legacy_v3.to_str().unwrap()).unwrap();
+        assert_eq!(loaded_v3.cfg.growth_rule, 1);
+        assert!(loaded_v3
+            .ownership_weights
+            .iter()
+            .all(|&weight| weight == 0.0));
+        std::fs::remove_file(legacy_v3).unwrap();
+        let legacy_v2 =
+            std::env::temp_dir().join(format!("neurofour-go-sparse-v2-{}.gns", std::process::id()));
+        let header: Vec<_> = legacy_lines[0].split_whitespace().collect();
+        legacy_lines[0] = format!("GNS2 {}", header[1..13].join(" "));
+        std::fs::write(&legacy_v2, legacy_lines.join("\n")).unwrap();
+        let loaded_v2 = GoSparseModel::load(legacy_v2.to_str().unwrap()).unwrap();
+        assert_eq!(loaded_v2.cfg.growth_rule, 0);
+        assert!(loaded_v2
+            .ownership_weights
+            .iter()
+            .all(|&weight| weight == 0.0));
+        std::fs::remove_file(legacy_v2).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(loaded.size, model.size);
         assert_eq!(loaded.nodes.len(), model.nodes.len());
@@ -2984,6 +3517,105 @@ mod tests {
         assert_eq!(
             loaded.value_with_komi(&board, 0.5),
             model.value_with_komi(&board, 0.5)
+        );
+        assert_eq!(
+            loaded.ownership_from_activations(&loaded.activations(&board, 0.5)),
+            model.ownership_from_activations(&model.activations(&board, 0.5))
+        );
+    }
+
+    #[test]
+    fn spatial_sparse_neurons_restrict_local_inputs_and_policy_ownership_outputs() {
+        let config = GoSparseConfig {
+            spatial_radius: 1,
+            ..GoSparseConfig::default()
+        };
+        let mut model = GoSparseModel::new(5, config, 83).unwrap();
+        for node in &mut model.nodes {
+            node.anchor = 12;
+            node.bias = 0.1;
+            for edge in &mut node.edges {
+                edge.input = 50;
+            }
+        }
+        for action in 0..=25 {
+            let start = action * model.cfg.max_nodes;
+            model.policy_weights[start..start + model.cfg.max_nodes].fill(1.0);
+        }
+        for point in 0..25 {
+            let start = point * model.cfg.max_nodes;
+            model.ownership_weights[start..start + model.cfg.max_nodes].fill(1.0);
+        }
+        let active = model.activations(&GoBoard::new(5).unwrap(), 0.5);
+        assert!(!active.is_empty());
+        assert!(model.input_is_local(12, 6));
+        assert!(!model.input_is_local(12, 0));
+        assert!(model.input_is_local(12, 50));
+        assert!(model.node_connects_to_action(0, 7));
+        assert!(!model.node_connects_to_action(0, 0));
+        assert!(model.node_connects_to_action(0, 25));
+        assert!(model.node_connects_to_point(0, 7));
+        assert!(!model.node_connects_to_point(0, 0));
+        assert!(model.policy_from_activations(7, &active) > 0.0);
+        assert_eq!(model.policy_from_activations(0, &active), 0.0);
+        let ownership = model.ownership_from_activations(&active);
+        assert!(ownership[7] > 0.0);
+        assert_eq!(ownership[0], 0.0);
+        let path =
+            std::env::temp_dir().join(format!("neurofour-go-spatial-{}.gns", std::process::id()));
+        model.save(path.to_str().unwrap()).unwrap();
+        let loaded = GoSparseModel::load(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(loaded.cfg.spatial_radius, 1);
+        assert_eq!(
+            loaded
+                .nodes
+                .iter()
+                .map(|node| node.anchor)
+                .collect::<Vec<_>>(),
+            model
+                .nodes
+                .iter()
+                .map(|node| node.anchor)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            loaded.policy_from_activations(7, &active),
+            model.policy_from_activations(7, &active)
+        );
+    }
+
+    #[test]
+    fn go_teacher_dataset_trains_policy_and_ownership_heads_and_roundtrips() {
+        let path =
+            std::env::temp_dir().join(format!("neurofour-go-teacher-{}.tsv", std::process::id()));
+        let ownership = (0..25)
+            .map(|point| if point % 2 == 0 { "1" } else { "-1" })
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(&path, format!("5\t0.5\t0 1\t2:0.7,7:0.3\t{ownership}\n")).unwrap();
+        let positions = load_teacher_positions(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let config = GoSparseConfig {
+            max_nodes: 16,
+            top_k: 8,
+            ..GoSparseConfig::default()
+        };
+        let mut model = GoSparseModel::new(5, config, 73).unwrap();
+        let baseline = model.evaluate_teacher_metrics(&positions).unwrap();
+        model.train_teacher(&positions, 4, 79).unwrap();
+        let trained = model.evaluate_teacher_metrics(&positions).unwrap();
+        assert!(trained.0 < baseline.0);
+        assert!(trained.1 < baseline.1);
+
+        let checkpoint =
+            std::env::temp_dir().join(format!("neurofour-go-teacher-{}.gns", std::process::id()));
+        model.save(checkpoint.to_str().unwrap()).unwrap();
+        let loaded = GoSparseModel::load(checkpoint.to_str().unwrap()).unwrap();
+        std::fs::remove_file(checkpoint).unwrap();
+        assert_eq!(
+            loaded.evaluate_teacher_metrics(&positions).unwrap(),
+            trained
         );
     }
 
