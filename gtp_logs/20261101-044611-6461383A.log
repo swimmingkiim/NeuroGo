@@ -1,0 +1,43 @@
+2026-11-01 04:46:11+0900: Running with following config:
+allowResignation = true
+lagBuffer = 1.0
+logAllGTPCommunication = false
+logDir = gtp_logs
+logSearchInfo = true
+logSearchInfoForChosenMove = false
+logToStderr = false
+maxTimePondering = 60.0
+maxVisits = 8
+numSearchThreads = 1
+ponderingEnabled = false
+resignConsecTurns = 3
+resignThreshold = -0.90
+rules = chinese
+searchFactorAfterOnePass = 0.50
+searchFactorAfterTwoPass = 0.25
+searchFactorWhenWinning = 0.40
+searchFactorWhenWinningThreshold = 0.95
+
+2026-11-01 04:46:11+0900: GTP Engine starting...
+2026-11-01 04:46:11+0900: KataGo v1.18.2
+2026-11-01 04:46:11+0900: Using Chinese rules initially, unless GTP/GUI overrides this
+2026-11-01 04:46:11+0900: Using 1 CPU thread(s) for search
+2026-11-01 04:46:11+0900: nnRandSeed0 = 11641110715581432063
+2026-11-01 04:46:11+0900: After dedups: nnModelFile0 = /tmp/neurogo-eval/model/b6c64.txt.gz useFP16 auto
+2026-11-01 04:46:11+0900: Initializing neural net buffer to be size 19 * 19 exactly
+2026-11-01 04:46:11+0900: Eigen (CPU) backend thread 0: Model version 11
+2026-11-01 04:46:11+0900: Eigen (CPU) backend thread 0: Model name: b6c64-19x19-v431q-25100-swa2-202412242150 (convnet, 454641 params)
+2026-11-01 04:46:11+0900: Loaded neural net with nnXLen 19 nnYLen 19
+2026-11-01 04:46:11+0900: Initializing board with boardXSize 19 boardYSize 19
+2026-11-01 04:46:11+0900: Loaded config /tmp/neurogo-katago-src/cpp/configs/gtp_example.cfg and/or command-line and query overrides
+2026-11-01 04:46:11+0900: Loaded model /tmp/neurogo-eval/model/b6c64.txt.gz
+2026-11-01 04:46:11+0900: Config override: logAllGTPCommunication = false
+2026-11-01 04:46:11+0900: Config override: maxVisits = 8
+2026-11-01 04:46:11+0900: Config override: numSearchThreads = 1
+2026-11-01 04:46:11+0900: Config override: ponderingEnabled = false
+2026-11-01 04:46:11+0900: Config override: rules = chinese
+2026-11-01 04:46:11+0900: Model name: b6c64-19x19-v431q-25100-swa2-202412242150
+2026-11-01 04:46:11+0900: GTP ready, beginning main protocol loop
+2026-11-01 04:46:11+0900: Quit requested by controller
+2026-11-01 04:46:11+0900: GPU -1 finishing, processed 0 rows 0 batches
+2026-11-01 04:46:11+0900: All cleaned up, quitting

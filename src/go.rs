@@ -739,6 +739,22 @@ pub fn validate_game(game: &GoGame) -> Result<(), String> {
     Ok(())
 }
 
+fn numeric_score_target(result: Option<&str>, turn: i8, size: usize) -> Option<f32> {
+    let result = result?.trim();
+    let (sign, margin) = if let Some(margin) = result.strip_prefix("B+") {
+        (1.0, margin)
+    } else if let Some(margin) = result.strip_prefix("W+") {
+        (-1.0, margin)
+    } else {
+        return None;
+    };
+    let margin = margin.parse::<f32>().ok()?;
+    if !margin.is_finite() || margin < 0.0 {
+        return None;
+    }
+    Some((sign * margin / (size as f32 * 2.0)).clamp(-1.0, 1.0) * turn as f32)
+}
+
 pub fn split_games(
     games: &[GoGame],
     size: usize,
@@ -1320,6 +1336,7 @@ pub struct GoSparseEdge {
 pub struct GoSparseNode {
     pub anchor: usize,
     pub usage: f32,
+    pub global: bool,
     pub bias: f32,
     pub utility: f32,
     pub dormant: bool,
@@ -1333,6 +1350,7 @@ pub struct GoSparseConfig {
     pub top_k: usize,
     pub learning_rate: f32,
     pub value_learning_rate: f32,
+    pub score_learning_rate: f32,
     pub policy_learning_rate: f32,
     pub novelty_threshold: f32,
     pub error_threshold: f32,
@@ -1340,6 +1358,8 @@ pub struct GoSparseConfig {
     pub dormancy_steps: u64,
     pub growth_rule: u8,
     pub spatial_radius: usize,
+    pub global_node_fraction: f32,
+    pub mcts_candidates: usize,
     pub activation_balance: f32,
 }
 
@@ -1351,6 +1371,7 @@ impl Default for GoSparseConfig {
             top_k: 8,
             learning_rate: 0.0001,
             value_learning_rate: 0.00001,
+            score_learning_rate: 0.0001,
             policy_learning_rate: 0.002,
             novelty_threshold: 0.2,
             error_threshold: 0.55,
@@ -1358,6 +1379,8 @@ impl Default for GoSparseConfig {
             dormancy_steps: 20_000,
             growth_rule: 0,
             spatial_radius: 0,
+            global_node_fraction: 0.25,
+            mcts_candidates: 24,
             activation_balance: 0.2,
         }
     }
@@ -1369,6 +1392,8 @@ pub struct GoSparseModel {
     pub cfg: GoSparseConfig,
     pub nodes: Vec<GoSparseNode>,
     pub value_weights: Vec<f32>,
+    pub score_weights: Vec<f32>,
+    pub score_bias: f32,
     pub policy_weights: Vec<f32>,
     pub ownership_weights: Vec<f32>,
     pub ownership_biases: Vec<f32>,
@@ -1431,9 +1456,11 @@ impl GoSparseModel {
             || cfg.top_k > cfg.max_nodes
             || !cfg.learning_rate.is_finite()
             || !cfg.value_learning_rate.is_finite()
+            || !cfg.score_learning_rate.is_finite()
             || !cfg.policy_learning_rate.is_finite()
             || cfg.learning_rate <= 0.0
             || cfg.value_learning_rate <= 0.0
+            || cfg.score_learning_rate < 0.0
             || cfg.policy_learning_rate <= 0.0
             || !cfg.novelty_threshold.is_finite()
             || !(0.0..=1.0).contains(&cfg.novelty_threshold)
@@ -1443,6 +1470,10 @@ impl GoSparseModel {
             || cfg.prune_strength < 0.0
             || cfg.growth_rule > 2
             || cfg.spatial_radius >= size
+            || !cfg.global_node_fraction.is_finite()
+            || !(0.0..=1.0).contains(&cfg.global_node_fraction)
+            || cfg.mcts_candidates == 0
+            || cfg.mcts_candidates > size * size + 1
             || !cfg.activation_balance.is_finite()
             || !(0.0..=2.0).contains(&cfg.activation_balance)
         {
@@ -1468,23 +1499,28 @@ impl GoSparseModel {
                 .collect()
         } else {
             let node_count = cfg.max_nodes.div_ceil(2).max(cfg.top_k).min(points);
+            let global_count = (node_count as f32 * cfg.global_node_fraction).round() as usize;
             (0..node_count)
                 .map(|node_index| {
                     let anchor = node_index * points / node_count;
                     let input = rng.usize(2) * points + anchor;
-                    Self::new_sparse_node(
+                    let mut node = Self::new_sparse_node(
                         anchor,
                         input,
                         points,
                         cfg.top_k as f32 / cfg.max_nodes as f32,
                         &mut rng,
-                    )
+                    );
+                    node.global = node_index < global_count;
+                    node
                 })
                 .collect()
         };
         Ok(Self {
             size,
             value_weights: vec![0.0; cfg.max_nodes],
+            score_weights: vec![0.0; cfg.max_nodes],
+            score_bias: 0.0,
             policy_weights: vec![0.0; (size * size + 1) * cfg.max_nodes],
             ownership_weights: vec![0.0; size * size * cfg.max_nodes],
             ownership_biases: vec![0.0; size * size],
@@ -1504,6 +1540,7 @@ impl GoSparseModel {
         GoSparseNode {
             anchor,
             usage,
+            global: false,
             bias: 0.0,
             utility: 0.1,
             dormant: false,
@@ -1536,11 +1573,14 @@ impl GoSparseModel {
             && first_y.abs_diff(second_y) <= self.cfg.spatial_radius
     }
 
-    fn input_is_local(&self, anchor: usize, input: usize) -> bool {
+    fn input_is_local(&self, anchor: usize, global: bool, input: usize) -> bool {
         let points = self.size * self.size;
         let input_features = points * 8 + 2;
         if input >= input_features {
             return false;
+        }
+        if global {
+            return true;
         }
         if input == points * 2 || input == points * 2 + 1 {
             return true;
@@ -1562,12 +1602,14 @@ impl GoSparseModel {
 
     fn node_connects_to_action(&self, node_index: usize, action: usize) -> bool {
         action == self.size * self.size
+            || self.nodes[node_index].global
             || self.cfg.spatial_radius == 0
             || self.within_spatial_radius(self.nodes[node_index].anchor, action)
     }
 
     fn node_connects_to_point(&self, node_index: usize, point: usize) -> bool {
-        self.cfg.spatial_radius == 0
+        self.nodes[node_index].global
+            || self.cfg.spatial_radius == 0
             || self.within_spatial_radius(self.nodes[node_index].anchor, point)
     }
 
@@ -1641,6 +1683,15 @@ impl GoSparseModel {
             .map(|(index, activation, _)| self.value_weights[*index] * activation)
             .sum::<f32>()
             .tanh()
+    }
+
+    fn score_from_activations(&self, active: &[(usize, f32, f32)]) -> f32 {
+        (self.score_bias
+            + active
+                .iter()
+                .map(|(index, activation, _)| self.score_weights[*index] * activation)
+                .sum::<f32>())
+        .tanh()
     }
 
     fn policy_from_activations(&self, action: usize, active: &[(usize, f32, f32)]) -> f32 {
@@ -1986,7 +2037,7 @@ impl GoSparseModel {
                 .total_cmp(&left.1)
                 .then_with(|| left.0.cmp(&right.0))
         });
-        candidates.truncate(12);
+        candidates.truncate(self.cfg.mcts_candidates);
         let prior_sum = candidates.iter().map(|candidate| candidate.1).sum::<f32>();
         let mut children = Vec::with_capacity(candidates.len());
         for (action, prior) in candidates {
@@ -2097,6 +2148,7 @@ impl GoSparseModel {
         komi: f32,
         action: usize,
         value_target: f32,
+        score_target: Option<f32>,
         rng: &mut Rng,
         growth_credit: &mut [HashMap<usize, (f32, u64)>],
     ) -> Result<f32, String> {
@@ -2119,9 +2171,15 @@ impl GoSparseModel {
         let prediction = self.value_from_activations(&active);
         let value_error = value_target - prediction;
         let value_delta = value_error * (1.0 - prediction * prediction);
+        let score_prediction = self.score_from_activations(&active);
+        let score_error = score_target.map(|target| target - score_prediction);
+        let score_delta = score_error
+            .map(|error| error * (1.0 - score_prediction * score_prediction))
+            .unwrap_or(0.0);
         let policy_learning_rate = self.cfg.policy_learning_rate;
         let learning_rate = self.cfg.learning_rate;
         let value_learning_rate = self.cfg.value_learning_rate;
+        let score_learning_rate = self.cfg.score_learning_rate;
         let mut policy_directions = Vec::with_capacity(legal.len());
         for (index, &candidate) in legal.iter().enumerate() {
             let target = f32::from(index == target_index);
@@ -2144,6 +2202,7 @@ impl GoSparseModel {
                 activation,
                 derivative,
                 value_learning_rate * value_delta * value_weight
+                    + score_learning_rate * score_delta * self.score_weights[index]
                     + policy_learning_rate * policy_delta,
             ));
         }
@@ -2176,6 +2235,9 @@ impl GoSparseModel {
         }
         for &(index, activation, _) in &active {
             self.value_weights[index] += value_learning_rate * value_delta * activation;
+            if score_target.is_some() {
+                self.score_weights[index] += score_learning_rate * score_delta * activation;
+            }
             for &(candidate, direction) in &policy_directions {
                 if !self.node_connects_to_action(index, candidate) {
                     continue;
@@ -2184,9 +2246,15 @@ impl GoSparseModel {
                     policy_learning_rate * direction * activation;
             }
         }
+        if score_target.is_some() {
+            self.score_bias += score_learning_rate * score_delta;
+        }
         self.step += 1;
         for (index, activation, derivative, hidden_delta) in hidden_deltas {
-            let model_error = value_error.abs().max(1.0 - probabilities[target_index]);
+            let model_error = value_error
+                .abs()
+                .max(1.0 - probabilities[target_index])
+                .max(score_error.unwrap_or(0.0).abs());
             let new_input = if model_error > self.cfg.error_threshold
                 && self.nodes[index].edges.len() < self.cfg.max_edges_per_node
             {
@@ -2194,11 +2262,14 @@ impl GoSparseModel {
                     .iter()
                     .copied()
                     .filter(|input| {
-                        self.input_is_local(self.nodes[index].anchor, *input)
-                            && !self.nodes[index]
-                                .edges
-                                .iter()
-                                .any(|edge| edge.input as usize == *input)
+                        self.input_is_local(
+                            self.nodes[index].anchor,
+                            self.nodes[index].global,
+                            *input,
+                        ) && !self.nodes[index]
+                            .edges
+                            .iter()
+                            .any(|edge| edge.input as usize == *input)
                     })
                     .collect();
                 if missing.is_empty() {
@@ -2216,7 +2287,8 @@ impl GoSparseModel {
             node.bias += learning_rate * gradient;
             node.utility = node.utility * 0.995
                 + (value_error.abs() * activation.abs()
-                    + (1.0 - probabilities[target_index]) * activation.abs())
+                    + (1.0 - probabilities[target_index]) * activation.abs()
+                    + score_error.unwrap_or(0.0).abs() * activation.abs())
                     * 0.005;
             for edge in &mut node.edges {
                 let input = features[edge.input as usize];
@@ -2235,7 +2307,10 @@ impl GoSparseModel {
                 });
             }
         }
-        let model_error = value_error.abs().max(1.0 - probabilities[target_index]);
+        let model_error = value_error
+            .abs()
+            .max(1.0 - probabilities[target_index])
+            .max(score_error.unwrap_or(0.0).abs());
         let can_grow =
             self.nodes.len() < self.cfg.max_nodes || self.nodes.iter().any(|node| node.dormant);
         if model_error > self.cfg.error_threshold && can_grow {
@@ -2254,14 +2329,20 @@ impl GoSparseModel {
                 if self.step % 4096 == 0 {
                     self.maintain();
                 }
-                return Ok(value_error * value_error + policy_loss);
+                return Ok(value_error * value_error
+                    + policy_loss
+                    + score_error.map(|error| error * error).unwrap_or(0.0));
             }
             let input = self.select_growth_input(&active_inputs, rng);
             let points = self.size * self.size;
             let anchor = Self::input_point(self.size, input).unwrap_or_else(|| rng.usize(points));
+            let desired_global =
+                (self.nodes.len() as f32 * self.cfg.global_node_fraction).round() as usize;
+            let global_count = self.nodes.iter().filter(|node| node.global).count();
             let new_node = GoSparseNode {
                 anchor,
                 usage: self.cfg.top_k as f32 / self.cfg.max_nodes as f32,
+                global: global_count < desired_global,
                 bias: 0.0,
                 utility: model_error * 0.1,
                 dormant: false,
@@ -2280,6 +2361,7 @@ impl GoSparseModel {
                 self.nodes[index].usage = self.cfg.top_k as f32 / self.cfg.max_nodes as f32;
                 growth_credit[index].clear();
                 self.value_weights[index] = 0.0;
+                self.score_weights[index] = 0.0;
                 for action in 0..=self.size * self.size {
                     self.policy_weights[action * self.cfg.max_nodes + index] = 0.0;
                 }
@@ -2288,7 +2370,9 @@ impl GoSparseModel {
         if self.step % 4096 == 0 {
             self.maintain();
         }
-        Ok(value_error * value_error + policy_loss)
+        Ok(value_error * value_error
+            + policy_loss
+            + score_error.map(|error| error * error).unwrap_or(0.0))
     }
 
     fn maintain(&mut self) {
@@ -2334,11 +2418,17 @@ impl GoSparseModel {
                         winner if winner == board.turn => 1.0,
                         _ => -1.0,
                     };
+                    let score_target = if self.cfg.score_learning_rate > 0.0 {
+                        numeric_score_target(game.result.as_deref(), board.turn, self.size)
+                    } else {
+                        None
+                    };
                     total += self.train_position(
                         &board,
                         komi,
                         action,
                         target,
+                        score_target,
                         &mut rng,
                         &mut growth_credit,
                     )?;
@@ -2384,6 +2474,38 @@ impl GoSparseModel {
         Ok((squared_error / positions as f32, positions))
     }
 
+    pub fn evaluate_score_loss(&self, games: &[GoGame]) -> Result<(Option<f32>, usize), String> {
+        let mut squared_error = 0.0;
+        let mut positions = 0usize;
+        for game in games.iter().filter(|game| game.size == self.size) {
+            let Some(_) = numeric_score_target(game.result.as_deref(), game.first_turn, self.size)
+            else {
+                continue;
+            };
+            validate_game(game)?;
+            let komi = game.komi_value()?;
+            let mut board = GoBoard::with_setup(
+                self.size,
+                &game.black_setup,
+                &game.white_setup,
+                game.first_turn,
+            )?;
+            for &action in &game.moves {
+                let target = numeric_score_target(game.result.as_deref(), board.turn, self.size)
+                    .ok_or("numeric Go score target disappeared")?;
+                let prediction = self.score_from_activations(&self.activations(&board, komi));
+                let error = target - prediction;
+                squared_error += error * error;
+                positions += 1;
+                board.play(action)?;
+            }
+        }
+        Ok((
+            (positions > 0).then_some(squared_error / positions as f32),
+            positions,
+        ))
+    }
+
     fn evaluate_objective(&self, games: &[GoGame]) -> Result<(f32, f32), String> {
         let mut squared_error = 0.0;
         let mut objective = 0.0;
@@ -2415,8 +2537,18 @@ impl GoSparseModel {
                     .ok_or("Go validation move is not legal")?;
                 let value_loss = value_error * value_error;
                 let policy_loss = -probabilities[target_index].max(f32::MIN_POSITIVE).ln();
+                let score_loss = if self.cfg.score_learning_rate > 0.0 {
+                    numeric_score_target(game.result.as_deref(), board.turn, self.size)
+                        .map(|target| {
+                            let error = target - self.score_from_activations(&active);
+                            error * error
+                        })
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
                 squared_error += value_loss;
-                objective += value_loss + policy_loss;
+                objective += value_loss + policy_loss + score_loss;
                 positions += 1;
                 board.play(action)?;
             }
@@ -2516,7 +2648,7 @@ impl GoSparseModel {
         let mut writer = BufWriter::new(File::create(path).map_err(|error| error.to_string())?);
         writeln!(
             writer,
-            "GNS6 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+            "GNS7 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
             self.size,
             self.step,
             self.cfg.max_nodes,
@@ -2524,6 +2656,7 @@ impl GoSparseModel {
             self.cfg.top_k,
             self.cfg.learning_rate,
             self.cfg.value_learning_rate,
+            self.cfg.score_learning_rate,
             self.cfg.policy_learning_rate,
             self.cfg.novelty_threshold,
             self.cfg.error_threshold,
@@ -2531,14 +2664,21 @@ impl GoSparseModel {
             self.cfg.dormancy_steps,
             self.cfg.growth_rule,
             self.cfg.spatial_radius,
-            self.cfg.activation_balance
+            self.cfg.activation_balance,
+            self.cfg.global_node_fraction,
+            self.cfg.mcts_candidates
         )
         .map_err(|error| error.to_string())?;
         for node in &self.nodes {
             write!(
                 writer,
-                "N {} {} {} {} {}",
-                node.anchor, node.usage, node.bias, node.utility, node.dormant as u8
+                "N {} {} {} {} {} {}",
+                node.anchor,
+                node.usage,
+                node.global as u8,
+                node.bias,
+                node.utility,
+                node.dormant as u8
             )
             .map_err(|error| error.to_string())?;
             for edge in &node.edges {
@@ -2555,6 +2695,17 @@ impl GoSparseModel {
             writer,
             "V {}",
             self.value_weights
+                .iter()
+                .map(f32::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+        .map_err(|error| error.to_string())?;
+        writeln!(
+            writer,
+            "S {} {}",
+            self.score_bias,
+            self.score_weights
                 .iter()
                 .map(f32::to_string)
                 .collect::<Vec<_>>()
@@ -2606,10 +2757,9 @@ impl GoSparseModel {
                 | (Some("GNS4"), 14)
                 | (Some("GNS5"), 15)
                 | (Some("GNS6"), 16)
+                | (Some("GNS7"), 19)
         ) {
-            return Err(
-                "unsupported Go checkpoint; train the Go sparse model to create GNS6".into(),
-            );
+            return Err("unsupported Go sparse checkpoint version".into());
         }
         let parse_usize = |index: usize| {
             fields[index]
@@ -2631,14 +2781,23 @@ impl GoSparseModel {
             top_k: parse_usize(5)?,
             learning_rate: parse_f32(6)?,
             value_learning_rate: parse_f32(7)?,
-            policy_learning_rate: parse_f32(8)?,
-            novelty_threshold: parse_f32(9)?,
-            error_threshold: parse_f32(10)?,
-            prune_strength: parse_f32(11)?,
-            dormancy_steps: fields[12]
+            score_learning_rate: if fields[0] == "GNS7" {
+                parse_f32(8)?
+            } else {
+                GoSparseConfig::default().score_learning_rate
+            },
+            policy_learning_rate: parse_f32(if fields[0] == "GNS7" { 9 } else { 8 })?,
+            novelty_threshold: parse_f32(if fields[0] == "GNS7" { 10 } else { 9 })?,
+            error_threshold: parse_f32(if fields[0] == "GNS7" { 11 } else { 10 })?,
+            prune_strength: parse_f32(if fields[0] == "GNS7" { 12 } else { 11 })?,
+            dormancy_steps: fields[if fields[0] == "GNS7" { 13 } else { 12 }]
                 .parse::<u64>()
                 .map_err(|_| "invalid Go sparse checkpoint")?,
-            growth_rule: if fields[0] == "GNS3" || fields[0] == "GNS4" {
+            growth_rule: if fields[0] == "GNS7" {
+                fields[14]
+                    .parse::<u8>()
+                    .map_err(|_| "invalid Go sparse growth rule")?
+            } else if fields[0] == "GNS3" || fields[0] == "GNS4" {
                 fields[13]
                     .parse::<u8>()
                     .map_err(|_| "invalid Go sparse growth rule")?
@@ -2649,15 +2808,25 @@ impl GoSparseModel {
             } else {
                 0
             },
-            spatial_radius: if fields[0] == "GNS5" || fields[0] == "GNS6" {
-                parse_usize(14)?
+            spatial_radius: if matches!(fields[0], "GNS5" | "GNS6" | "GNS7") {
+                parse_usize(if fields[0] == "GNS7" { 15 } else { 14 })?
             } else {
                 0
             },
-            activation_balance: if fields[0] == "GNS6" {
-                parse_f32(15)?
+            activation_balance: if matches!(fields[0], "GNS6" | "GNS7") {
+                parse_f32(if fields[0] == "GNS7" { 16 } else { 15 })?
             } else {
                 0.0
+            },
+            global_node_fraction: if fields[0] == "GNS7" {
+                parse_f32(17)?
+            } else {
+                0.0
+            },
+            mcts_candidates: if fields[0] == "GNS7" {
+                parse_usize(18)?
+            } else {
+                12.min(size * size + 1)
             },
         };
         if size < 5
@@ -2665,8 +2834,14 @@ impl GoSparseModel {
             || cfg.max_nodes == 0
             || cfg.top_k == 0
             || cfg.top_k > cfg.max_nodes
+            || !cfg.score_learning_rate.is_finite()
+            || cfg.score_learning_rate < 0.0
             || cfg.growth_rule > 2
             || cfg.spatial_radius >= size
+            || !cfg.global_node_fraction.is_finite()
+            || !(0.0..=1.0).contains(&cfg.global_node_fraction)
+            || cfg.mcts_candidates == 0
+            || cfg.mcts_candidates > size * size + 1
             || !cfg.activation_balance.is_finite()
             || !(0.0..=2.0).contains(&cfg.activation_balance)
         {
@@ -2676,6 +2851,8 @@ impl GoSparseModel {
         let mut model = Self {
             size,
             value_weights: vec![0.0; max_nodes],
+            score_weights: vec![0.0; max_nodes],
+            score_bias: 0.0,
             policy_weights: vec![0.0; (size * size + 1) * max_nodes],
             cfg,
             nodes: Vec::new(),
@@ -2684,6 +2861,7 @@ impl GoSparseModel {
             step,
         };
         let mut value_seen = false;
+        let mut score_seen = false;
         let mut policy_seen = vec![false; size * size + 1];
         let mut ownership_seen = vec![false; size * size];
         for line in lines {
@@ -2692,7 +2870,9 @@ impl GoSparseModel {
             match parts.first().copied() {
                 Some("N")
                     if parts.len()
-                        >= if fields[0] == "GNS6" {
+                        >= if fields[0] == "GNS7" {
+                            7
+                        } else if fields[0] == "GNS6" {
                             6
                         } else if fields[0] == "GNS5" {
                             5
@@ -2700,9 +2880,13 @@ impl GoSparseModel {
                             4
                         } =>
                 {
-                    let has_usage = fields[0] == "GNS6";
+                    let has_usage = matches!(fields[0], "GNS6" | "GNS7");
                     let has_anchor = matches!(fields[0], "GNS5" | "GNS6");
-                    let edge_start = if has_usage {
+                    let has_global = fields[0] == "GNS7";
+                    let has_anchor = has_anchor || has_global;
+                    let edge_start = if has_global {
+                        7
+                    } else if has_usage {
                         6
                     } else if has_anchor {
                         5
@@ -2731,7 +2915,8 @@ impl GoSparseModel {
                         if input >= size * size * 8 + 2 {
                             return Err("Go sparse checkpoint edge is out of range".into());
                         }
-                        if !model.input_is_local(anchor, input) {
+                        let global = has_global && parts[3] == "1";
+                        if !model.input_is_local(anchor, global, input) {
                             return Err(
                                 "Go sparse checkpoint edge exceeds its spatial radius".into()
                             );
@@ -2758,7 +2943,10 @@ impl GoSparseModel {
                         } else {
                             model.cfg.top_k as f32 / model.cfg.max_nodes as f32
                         },
-                        bias: parts[if has_usage {
+                        global: has_global && parts[3] == "1",
+                        bias: parts[if has_global {
+                            4
+                        } else if has_usage {
                             3
                         } else if has_anchor {
                             2
@@ -2767,7 +2955,9 @@ impl GoSparseModel {
                         }]
                         .parse()
                         .map_err(|_| "invalid Go sparse checkpoint node")?,
-                        utility: parts[if has_usage {
+                        utility: parts[if has_global {
+                            5
+                        } else if has_usage {
                             4
                         } else if has_anchor {
                             3
@@ -2776,7 +2966,9 @@ impl GoSparseModel {
                         }]
                         .parse()
                         .map_err(|_| "invalid Go sparse checkpoint node")?,
-                        dormant: parts[if has_usage {
+                        dormant: parts[if has_global {
+                            6
+                        } else if has_usage {
                             5
                         } else if has_anchor {
                             4
@@ -2793,6 +2985,21 @@ impl GoSparseModel {
                             .map_err(|_| "invalid Go sparse checkpoint value head")?;
                     }
                     value_seen = true;
+                }
+                Some("S")
+                    if fields[0] == "GNS7"
+                        && !score_seen
+                        && parts.len() == model.cfg.max_nodes + 2 =>
+                {
+                    model.score_bias = parts[1]
+                        .parse()
+                        .map_err(|_| "invalid Go sparse checkpoint score head")?;
+                    for (weight, value) in model.score_weights.iter_mut().zip(&parts[2..]) {
+                        *weight = value
+                            .parse()
+                            .map_err(|_| "invalid Go sparse checkpoint score head")?;
+                    }
+                    score_seen = true;
                 }
                 Some("P") if parts.len() == model.cfg.max_nodes + 2 => {
                     let action = parts[1]
@@ -2813,7 +3020,7 @@ impl GoSparseModel {
                     policy_seen[action] = true;
                 }
                 Some("O")
-                    if matches!(fields[0], "GNS4" | "GNS5" | "GNS6")
+                    if matches!(fields[0], "GNS4" | "GNS5" | "GNS6" | "GNS7")
                         && parts.len() == model.cfg.max_nodes + 3 =>
                 {
                     let point = parts[1]
@@ -2840,10 +3047,11 @@ impl GoSparseModel {
                 _ => return Err("invalid Go sparse checkpoint record".into()),
             }
         }
-        let missing_ownership =
-            matches!(fields[0], "GNS4" | "GNS5" | "GNS6") && ownership_seen.contains(&false);
+        let missing_ownership = matches!(fields[0], "GNS4" | "GNS5" | "GNS6" | "GNS7")
+            && ownership_seen.contains(&false);
         if model.nodes.len() > model.cfg.max_nodes
             || !value_seen
+            || (fields[0] == "GNS7" && !score_seen)
             || policy_seen.contains(&false)
             || missing_ownership
         {
@@ -3329,9 +3537,9 @@ fn parse_gtp_vertex(vertex: &str, board: &GoBoard) -> Result<Option<usize>, Stri
     Ok(Some((board.size - row) * board.size + col))
 }
 
-fn parse_gtp_final_score(score: &str) -> Result<Option<i8>, String> {
+fn parse_gtp_final_score_margin(score: &str) -> Result<(Option<i8>, f32), String> {
     match score {
-        "0" | "Jigo" | "Draw" => Ok(None),
+        "0" | "Jigo" | "Draw" => Ok((None, 0.0)),
         value if value.starts_with("B+") || value.starts_with("W+") => {
             let winner = if value.starts_with("B+") { 1 } else { -1 };
             let margin = value[2..]
@@ -3340,7 +3548,7 @@ fn parse_gtp_final_score(score: &str) -> Result<Option<i8>, String> {
             if !margin.is_finite() || margin < 0.0 {
                 return Err(format!("invalid GTP final score: {score}"));
             }
-            Ok(Some(winner))
+            Ok((Some(winner), margin))
         }
         _ => Err(format!("unsupported GTP final score: {score}")),
     }
@@ -3432,7 +3640,7 @@ where
                     results.record(model_color, None);
                 }
                 let engine_score = gtp_query(&mut input, &mut output, "final_score")?;
-                let engine_winner = parse_gtp_final_score(&engine_score)?;
+                let (engine_winner, final_margin) = parse_gtp_final_score_margin(&engine_score)?;
                 let local_winner = if score > 0.0 {
                     Some(1)
                 } else if score < 0.0 {
@@ -3447,6 +3655,9 @@ where
                     model_color,
                     engine_winner.map(|winner| winner == model_color),
                 );
+                let model_margin = engine_winner
+                    .map(|winner| final_margin * if winner == model_color { 1.0 } else { -1.0 });
+                results.record_score_margin(model_color, model_margin);
             }
         }
         Ok(results)
@@ -3517,6 +3728,12 @@ pub struct GtpBenchmarkResults {
     pub model_black: (usize, usize, usize),
     pub model_white: (usize, usize, usize),
     pub score_disagreements: usize,
+    pub score_margin_total: f64,
+    pub score_margin_games: usize,
+    pub black_score_margin_total: f64,
+    pub black_score_margin_games: usize,
+    pub white_score_margin_total: f64,
+    pub white_score_margin_games: usize,
     recorded_outcomes: Vec<Option<bool>>,
 }
 
@@ -3583,6 +3800,30 @@ impl GtpBenchmarkResults {
             }
         }
     }
+
+    fn record_score_margin(&mut self, model_color: i8, margin: Option<f32>) {
+        let Some(margin) = margin else {
+            return;
+        };
+        self.score_margin_total += margin as f64;
+        self.score_margin_games += 1;
+        if model_color == 1 {
+            self.black_score_margin_total += margin as f64;
+            self.black_score_margin_games += 1;
+        } else {
+            self.white_score_margin_total += margin as f64;
+            self.white_score_margin_games += 1;
+        }
+    }
+
+    pub fn score_margin_means(&self) -> (Option<f64>, Option<f64>, Option<f64>) {
+        let mean = |total: f64, games: usize| (games > 0).then_some(total / games as f64);
+        (
+            mean(self.score_margin_total, self.score_margin_games),
+            mean(self.black_score_margin_total, self.black_score_margin_games),
+            mean(self.white_score_margin_total, self.white_score_margin_games),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -3595,7 +3836,7 @@ mod tests {
             size: 5,
             moves: vec![0, 1, 5, 6, 25, 2],
             winner: 1,
-            result: None,
+            result: Some("B+3.5".into()),
             komi: Some("0.5".into()),
             first_turn: 1,
             black_setup: Vec::new(),
@@ -3609,6 +3850,12 @@ mod tests {
         let initial_value = model.value_with_komi(&GoBoard::new(5).unwrap(), 0.5);
         let loss = model.train(std::slice::from_ref(&game), 2, 19).unwrap();
         assert!(loss.is_finite());
+        assert!(model.score_weights.iter().any(|weight| *weight != 0.0));
+        let (score_mse, score_positions) = model
+            .evaluate_score_loss(std::slice::from_ref(&game))
+            .unwrap();
+        assert!(score_mse.is_some_and(f32::is_finite));
+        assert_eq!(score_positions, game.moves.len());
         let board = GoBoard::new(5).unwrap();
         assert_ne!(model.value_with_komi(&board, 0.5), initial_value);
         let selected = model.choose_with_komi(&board, &mut Rng::new(23), 0.5);
@@ -3625,8 +3872,27 @@ mod tests {
         model.save(path.to_str().unwrap()).unwrap();
         let loaded = GoSparseModel::load(path.to_str().unwrap()).unwrap();
         let serialized = std::fs::read_to_string(&path).unwrap();
-        let legacy_gns5: Vec<_> = serialized
+        let legacy_gns6: Vec<_> = serialized
             .lines()
+            .filter(|line| !line.starts_with("S "))
+            .map(|line| {
+                if line.starts_with("GNS7 ") {
+                    let header: Vec<_> = line.split_whitespace().collect();
+                    format!(
+                        "GNS6 {} {}",
+                        header[1..8].join(" "),
+                        header[9..17].join(" ")
+                    )
+                } else if line.starts_with("N ") {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    format!("N {} {} {}", fields[1], fields[2], fields[4..].join(" "))
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect();
+        let legacy_gns5: Vec<_> = legacy_gns6
+            .iter()
             .map(|line| {
                 if line.starts_with("GNS6 ") {
                     let header: Vec<_> = line.split_whitespace().collect();
@@ -3639,6 +3905,17 @@ mod tests {
                 }
             })
             .collect();
+        let legacy_v6 =
+            std::env::temp_dir().join(format!("neurofour-go-sparse-v6-{}.gns", std::process::id()));
+        std::fs::write(&legacy_v6, legacy_gns6.join("\n")).unwrap();
+        let loaded_v6 = GoSparseModel::load(legacy_v6.to_str().unwrap()).unwrap();
+        assert_eq!(loaded_v6.cfg.spatial_radius, model.cfg.spatial_radius);
+        assert_eq!(
+            loaded_v6.cfg.activation_balance,
+            model.cfg.activation_balance
+        );
+        assert!(loaded_v6.score_weights.iter().all(|weight| *weight == 0.0));
+        std::fs::remove_file(legacy_v6).unwrap();
         let legacy_v5 =
             std::env::temp_dir().join(format!("neurofour-go-sparse-v5-{}.gns", std::process::id()));
         std::fs::write(&legacy_v5, legacy_gns5.join("\n")).unwrap();
@@ -3703,6 +3980,23 @@ mod tests {
         assert_eq!(loaded.cfg.growth_rule, 1);
         assert_eq!(loaded.cfg.activation_balance, model.cfg.activation_balance);
         assert_eq!(
+            loaded.cfg.global_node_fraction,
+            model.cfg.global_node_fraction
+        );
+        assert_eq!(loaded.cfg.mcts_candidates, model.cfg.mcts_candidates);
+        assert_eq!(
+            loaded
+                .nodes
+                .iter()
+                .map(|node| node.global)
+                .collect::<Vec<_>>(),
+            model
+                .nodes
+                .iter()
+                .map(|node| node.global)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
             loaded
                 .nodes
                 .iter()
@@ -3722,6 +4016,48 @@ mod tests {
             loaded.ownership_from_activations(&loaded.activations(&board, 0.5)),
             model.ownership_from_activations(&model.activations(&board, 0.5))
         );
+        assert_eq!(loaded.score_weights, model.score_weights);
+        assert_eq!(loaded.score_bias, model.score_bias);
+    }
+
+    #[test]
+    fn score_targets_ignore_resignations_and_use_side_to_move_perspective() {
+        assert_eq!(
+            numeric_score_target(Some("B+12.5"), 1, 19),
+            Some(12.5 / 38.0)
+        );
+        assert_eq!(
+            numeric_score_target(Some("B+12.5"), -1, 19),
+            Some(-12.5 / 38.0)
+        );
+        assert_eq!(numeric_score_target(Some("W+R"), 1, 19), None);
+        assert_eq!(numeric_score_target(Some("B+NaN"), 1, 19), None);
+    }
+
+    #[test]
+    fn zero_score_learning_rate_disables_auxiliary_score_training() {
+        let game = GoGame {
+            size: 5,
+            moves: vec![0, 1, 5, 6, 25, 2],
+            winner: 1,
+            result: Some("B+3.5".into()),
+            komi: Some("0.5".into()),
+            first_turn: 1,
+            black_setup: Vec::new(),
+            white_setup: Vec::new(),
+        };
+        let mut model = GoSparseModel::new(
+            5,
+            GoSparseConfig {
+                score_learning_rate: 0.0,
+                ..GoSparseConfig::default()
+            },
+            87,
+        )
+        .unwrap();
+        model.train(std::slice::from_ref(&game), 1, 88).unwrap();
+        assert!(model.score_weights.iter().all(|weight| *weight == 0.0));
+        assert_eq!(model.score_bias, 0.0);
     }
 
     #[test]
@@ -3733,6 +4069,7 @@ mod tests {
         let mut model = GoSparseModel::new(5, config, 83).unwrap();
         for node in &mut model.nodes {
             node.anchor = 12;
+            node.global = false;
             node.bias = 0.1;
             for edge in &mut node.edges {
                 edge.input = 50;
@@ -3748,9 +4085,9 @@ mod tests {
         }
         let active = model.activations(&GoBoard::new(5).unwrap(), 0.5);
         assert!(!active.is_empty());
-        assert!(model.input_is_local(12, 6));
-        assert!(!model.input_is_local(12, 0));
-        assert!(model.input_is_local(12, 50));
+        assert!(model.input_is_local(12, false, 6));
+        assert!(!model.input_is_local(12, false, 0));
+        assert!(model.input_is_local(12, false, 50));
         assert!(model.node_connects_to_action(0, 7));
         assert!(!model.node_connects_to_action(0, 0));
         assert!(model.node_connects_to_action(0, 25));
@@ -3783,6 +4120,49 @@ mod tests {
             loaded.policy_from_activations(7, &active),
             model.policy_from_activations(7, &active)
         );
+    }
+
+    #[test]
+    fn spatial_sparse_model_initializes_mixed_local_and_global_neurons() {
+        let model = GoSparseModel::new(
+            5,
+            GoSparseConfig {
+                spatial_radius: 1,
+                global_node_fraction: 0.4,
+                ..GoSparseConfig::default()
+            },
+            84,
+        )
+        .unwrap();
+        let global_nodes = model.nodes.iter().filter(|node| node.global).count();
+        assert!(global_nodes > 0);
+        assert!(global_nodes < model.nodes.len());
+        let global_index = model.nodes.iter().position(|node| node.global).unwrap();
+        assert!(model.node_connects_to_action(global_index, 0));
+        assert!(model.node_connects_to_point(global_index, 0));
+        assert!(model.input_is_local(model.nodes[global_index].anchor, true, 0));
+    }
+
+    #[test]
+    fn mcts_expansion_respects_the_configured_candidate_limit() {
+        let model = GoSparseModel::new(
+            5,
+            GoSparseConfig {
+                mcts_candidates: 3,
+                ..GoSparseConfig::default()
+            },
+            85,
+        )
+        .unwrap();
+        let mut tree = vec![GoSearchNode {
+            board: GoBoard::new(5).unwrap(),
+            children: Vec::new(),
+            visits: 0,
+            value_sum: 0.0,
+            expanded: false,
+        }];
+        model.expand_search_node(&mut tree, 0, 6.5).unwrap();
+        assert_eq!(tree[0].children.len(), 3);
     }
 
     #[test]
@@ -3913,21 +4293,33 @@ mod tests {
     fn gtp_benchmark_results_track_outcomes_by_color() {
         let mut results = GtpBenchmarkResults::default();
         results.record(1, Some(true));
+        results.record_score_margin(1, Some(3.5));
         results.record(-1, Some(false));
+        results.record_score_margin(-1, Some(-7.5));
         results.record(-1, None);
         results.replace_last_result(-1, Some(true));
 
         assert_eq!((results.wins, results.losses, results.draws), (2, 1, 0));
         assert_eq!(results.model_black, (1, 0, 0));
         assert_eq!(results.model_white, (1, 1, 0));
+        assert_eq!(
+            results.score_margin_means(),
+            (Some(-2.0), Some(3.5), Some(-7.5))
+        );
     }
 
     #[test]
     fn gtp_final_score_parser_handles_wins_losses_and_draws() {
-        assert_eq!(parse_gtp_final_score("B+3.5").unwrap(), Some(1));
-        assert_eq!(parse_gtp_final_score("W+7.5").unwrap(), Some(-1));
-        assert_eq!(parse_gtp_final_score("0").unwrap(), None);
-        assert!(parse_gtp_final_score("B+R").is_err());
+        assert_eq!(
+            parse_gtp_final_score_margin("B+3.5").unwrap(),
+            (Some(1), 3.5)
+        );
+        assert_eq!(parse_gtp_final_score_margin("0").unwrap(), (None, 0.0));
+        assert_eq!(
+            parse_gtp_final_score_margin("W+7.5").unwrap(),
+            (Some(-1), 7.5)
+        );
+        assert!(parse_gtp_final_score_margin("B+R").is_err());
     }
 
     #[test]

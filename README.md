@@ -448,7 +448,7 @@ cargo run --release -- go-evaluate \
 
 현재 `go-train`, `go-evaluate`, `go-benchmark`, `go-benchmark-gtp` 명령은 Go 전용 동적 희소 뉴런·시냅스 모델을 사용합니다. top-k 희소 trunk의 입력은 차례 기준 돌 점유, bias/komi에 더해 각 교차점에 아군·상대 그룹의 1/2/3+ 활로를 나타내는 여섯 feature plane을 포함합니다. 학습은 8가지 보드 대칭을 적용하고, policy head는 합법 착수 전체에 대한 softmax cross-entropy, value head는 승패를 학습합니다. GNS3 체크포인트는 뉴런, 시냅스, 양쪽 출력 head와 성장 규칙을 저장합니다. 기존 GNS2 및 구형 feature 형식의 GNS3 파일도 읽을 수 있으며, NGO1/NGO2 선형 체크포인트는 새 Go CLI와 별도 형식입니다.
 
-실험용 `go-train` 인자는 validation split seed 뒤에 최대 뉴런 수, top-k 활성 수, 뉴런별 입력 시냅스 상한, 성장 오류 임계값, 입력 novelty 임계값, 연결 가지치기 강도, 성장 규칙을 순서대로 받습니다. 생략 시 `128, 8, 16, 0.55, 0.2, 0.01, 0`을 사용합니다. 성장 규칙 `0`은 무작위 활성 feature 선택, `1`은 현재 전체 네트워크에서 연결 수가 가장 적은 활성 입력 feature 선택입니다. `go-benchmark-mcts <model> <games> <seed> <komi> <simulations> [cpuct=1.4] [opponent=heuristic|random]`은 내장 상대와, `go-benchmark-gtp-mcts <model> <engine> <games> <seed> <komi> <simulations> <cpuct> [engine-arg ...]`은 GTP 엔진과 정책 상위 12수 제한 PUCT 대국을 실행합니다. 모델 생성/학습 seed, train/validation 분할, epoch 수가 같도록 두고 한 요인씩 바꾸는 것을 권장합니다.
+실험용 `go-train` 인자는 validation split seed 뒤에 최대 뉴런 수, top-k 활성 수, 뉴런별 입력 시냅스 상한, 성장 오류 임계값, 입력 novelty 임계값, 연결 가지치기 강도, 성장 규칙을 순서대로 받습니다. 생략 시 `128, 8, 16, 0.55, 0.2, 0.01, 0`을 사용합니다. 성장 규칙 `0`은 무작위 활성 feature 선택, `1`은 현재 전체 네트워크에서 연결 수가 가장 적은 활성 입력 feature 선택입니다. `go-benchmark-mcts <model> <games> <seed> <komi> <simulations> [cpuct=1.4] [opponent=heuristic|random]`은 내장 상대와, `go-benchmark-gtp-mcts <model> <engine> <games> <seed> <komi> <simulations> <cpuct> [mcts_candidates] [engine-arg ...]`은 GTP 엔진과 정책 상위 후보 수 제한 PUCT 대국을 실행합니다. 후보 수 인수를 생략하면 체크포인트 설정을 사용하고, 기존처럼 바로 engine arguments를 지정하는 호출도 지원합니다. 모델 생성/학습 seed, train/validation 분할, epoch 수가 같도록 두고 한 요인씩 바꾸는 것을 권장합니다.
 
 ### 데이터 양 및 희소 구조 ablation
 
@@ -721,7 +721,9 @@ cargo run --release -- go-distill \
 
 ### 위치 기반 희소 trunk 실험
 
-`go-train`의 마지막 선택 인수 `spatial_radius`로 지역 희소 모델을 학습할 수 있습니다. 기본값 `0`은 이전 전역 연결 모델이며, 양수 `r`은 각 뉴런의 고정 anchor에서 체비쇼프 거리 `r` 안의 board feature만 입력 시냅스로 연결하고, policy/ownership 출력도 그 anchor 주변에만 연결합니다. 차례·komi 입력은 전역 입력으로 허용되고 value head는 전역 pooling을 유지합니다. 공간 모델의 뉴런은 보드에 고르게 초기 배치하고, 남은 용량은 데이터 기반 성장에 둡니다. 체크포인트 GNS6에는 anchor, 반경, 뉴런 사용률 설정과 통계를 저장하며 GNS2–GNS5 형식도 계속 읽습니다.
+`go-train`의 마지막 선택 인수 `spatial_radius`로 지역 희소 모델을 학습할 수 있습니다. 기본값 `0`은 이전 전역 연결 모델이며, 양수 `r`은 각 local 뉴런의 고정 anchor에서 체비쇼프 거리 `r` 안의 board feature만 입력 시냅스로 연결하고 policy/ownership 출력도 그 anchor 주변에만 연결합니다. `global_node_fraction`(기본 `.25`) 비율의 global 뉴런은 보드 전체를 입력 receptive field와 policy/ownership 출력에 연결해 지역 문맥과 장거리 상호작용을 함께 표현합니다. 차례·komi 입력은 모든 뉴런에 허용되고 value head는 전역 pooling을 유지합니다. 공간 모델의 뉴런은 보드에 고르게 초기 배치하고, 남은 용량은 데이터 기반 성장에 둡니다. 체크포인트 GNS7은 노드별 local/global 종류, anchor, 반경, 보조 score head, 연결 비율과 MCTS 후보 폭을 저장하며 기존 GNS2–GNS6 형식도 계속 읽습니다.
+
+숫자 점수 결과(`B+3.5`, `W+12.5` 등)가 있는 기보는 별도 score head의 보조 target으로 사용합니다. 점수 margin을 `2 × board_size`로 정규화해 현재 차례 관점의 `[-1, 1]` 범위로 학습하며, 기권 결과(`B+R`/`W+R`)와 숫자로 파싱할 수 없는 결과는 score 학습에서 제외합니다. value 승패 head와 policy 목적은 유지됩니다. `score_learning_rate`는 기본 `.0001`이며 `0`으로 설정하면 score 학습과 early-stopping 목적에서 보조 head를 제외합니다. MCTS의 policy 후보 확장 폭은 기존 12에서 기본 24로 늘렸으며 `mcts_candidates`로 조절할 수 있습니다. 이는 모델·탐색 경로를 확장한 것이며 기력 향상을 보장하지 않습니다.
 
 ```bash
 cargo run --release -- go-train \
@@ -738,6 +740,41 @@ cargo run --release -- go-train \
   1 42 0.1 42 128 16 16 0.55 0.2 0.01 0 4
 cargo run --release -- go-evaluate \
   checkpoints/go/kgs-march-spatial-r2.gns data/go/kgs-2019-04.csv
+```
+
+지역/전역 회로 비율, score 보조 학습률, MCTS 후보 폭은 `go-train`의 마지막 세 선택 인수로 조절할 수 있습니다. 예를 들어 아래 설정은 radius 2 안의 local 뉴런과 25% global 뉴런을 함께 사용하고, MCTS에서 policy 상위 32수를 확장합니다.
+
+```bash
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-1450-seed42.csv \
+  checkpoints/go/kgs-march-local-global-score.gns \
+  1 42 0.1 42 128 8 16 0.55 0.2 0.01 2 2 0.2 0.00001 0.0001 0.25 32
+```
+
+### Local/global 회로 및 score head smoke 비교
+
+새 경로의 동작과 proxy 지표를 확인하기 위해 KGS March 300게임을 같은 게임 단위 분할(seed 42, train 270/validation 30), 학습 seed 43, 1 epoch, 64 nodes/top-k 8/edge cap 12로 비교했습니다. 두 설정 모두 activation balance `.2`, gradient-credit 성장, 숫자 score 보조 학습을 사용했고, 차이는 global-only(radius 0, MCTS 12 후보)와 local/global 혼합(radius 2, global 25%, MCTS 24 후보)입니다.
+
+| 구조 | Validation value MSE | Validation score MSE (착수) | April value MSE | April score MSE (착수) | April policy top-1 |
+|---|---:|---:|---:|---:|---:|
+| Global-only | `.998441` | `.633106` (1,836) | `.998344` | `.435922` (47,284) | `1.0486%` |
+| Local/global | `.998414` | `.631285` (1,836) | `.998388` | `.436369` (47,284) | `1.1530%` |
+
+April은 별도 KGS 2019-04 데이터 1,231판/232,601착수이며 policy 균등 합법수 baseline은 `.4479%`였습니다. 혼합 구조는 이 단일 seed에서 policy top-1이 높았지만 value와 score MSE는 global-only보다 약간 나빴습니다. 차이는 작고 승률 대국이나 여러 seed 검증이 아니므로 기력 개선으로 해석하지 않습니다. 학습 소요 시간은 global-only 24초, 혼합 40초였고 peak RAM은 각각 약 8.9/9.2 MiB였습니다. 이 비교는 교사 엔진 없이 학습·저장·재로딩·독립 데이터 평가까지 연결되는지 확인한 smoke test입니다.
+
+재현 예시:
+
+```bash
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-300-seed42.csv \
+  checkpoints/go/kgs-march-global-control.gns \
+  1 43 0.1 42 64 8 12 0.55 0.2 0.01 2 0 0.2 0.00001 0.0001 0 12
+cargo run --release -- go-train \
+  data/go/experiments/kgs-march-300-seed42.csv \
+  checkpoints/go/kgs-march-local-global-score.gns \
+  1 43 0.1 42 64 8 12 0.55 0.2 0.01 2 2 0.2 0.00001 0.0001 0.25 24
+cargo run --release -- go-evaluate \
+  checkpoints/go/kgs-march-local-global-score.gns data/go/kgs-2019-04.csv
 ```
 
 같은 KGS March 학습 게임·seed·1 epoch·고정 split을 사용하고, 독립 April 1,231판/232,601착수로 평가했습니다. 전역 baseline 체크포인트도 같은 평가 명령으로 재실행했습니다.
@@ -765,7 +802,7 @@ cargo run --release -- go-benchmark-gtp \
   -override-config maxVisits=32,numSearchThreads=1,rules=chinese,ponderingEnabled=false
 ```
 
-이하의 기존 구조 ablation 및 첫 sparse 재학습 결과는 활로 feature·대칭 증강·합법수 전체 softmax·MCTS를 추가하기 전 초기 모델을 대상으로 한 과거 기준선입니다. 현재 모델은 그룹 활로 feature, 정책 유도 MCTS, 실험용 지역 연결 trunk를 갖지만, 유효한 ownership 교사 신호, score 보조 학습, self-play 강화학습은 아직 없습니다. 공간 trunk 수치를 아래 과거 결과와 혼합해 해석하지 않습니다.
+이하의 기존 구조 ablation 및 첫 sparse 재학습 결과는 활로 feature·대칭 증강·합법수 전체 softmax·MCTS를 추가하기 전 초기 모델을 대상으로 한 과거 기준선입니다. 현재 모델은 그룹 활로 feature, 정책 유도 MCTS, 실험용 local/global 연결 trunk, 숫자 점수 결과가 있는 게임에 한정한 score 보조 학습을 갖습니다. 여전히 유효한 ownership 교사 신호와 self-play 강화학습은 없으며, 공간 trunk 수치를 아래 과거 결과와 혼합해 해석하지 않습니다.
 
 첫 19×19 재학습은 KGS 2019 2,681판을 게임 단위 2,413/268 train/validation으로 나눠 seed 42, 최대 3 epoch 수행했습니다. epoch 3이 선택됐고, 128개 뉴런·739개 입력 시냅스(top-k 8)로 validation value MSE `.985466`을 기록했습니다(초기 무예측 기준 1.000000, 학습+검증 선택 약 65.8초, peak RAM 약 14.6 MiB). value는 개선됐지만 차이는 작습니다.
 
@@ -810,3 +847,49 @@ cargo run --release -- go-benchmark-gtp \
 ```
 
 현재 Go 경로는 동적 희소 뉴런·시냅스, 그룹 활로 입력, 대칭 증강, 합법수 전체 policy 학습과 제한 MCTS를 사용합니다. 그러나 제한 MCTS 대국 결과는 약한 내장 heuristic 상대와의 소표본이며 KataGo급 기력의 증거가 아닙니다. KGS/Fox 중복 검사도 불완전합니다. 더 넓은 기보, 다중 seed와 충분한 판수, 고정된 계산 예산의 외부 엔진 대국이 필요합니다.
+
+### 다중 seed 학습 및 KataGo 대국 (2026-11-01)
+
+교사 엔진 없이 1,450개의 KGS March 게임을 게임 단위로 고정 분할(seed 42, train 1,305 / validation 145)하고, 학습 seed 42·43·44 각각에서 최대 3 epochs 학습했습니다. 대조군은 global-only(radius 0, global node fraction 0, score learning rate 0), 실험군은 local/global(radius 2, global node fraction 0.25, score learning rate 0.0001)입니다. 그 외 뉴런 수 128, top-k 8, 노드당 최대 연결 16, growth rule 2, activation balance 0.2 등은 동일합니다. validation objective 기준 세 seed 모두 3번째 epoch가 선택됐으므로 더 긴 학습의 수렴 여부는 확인하지 않았습니다.
+
+| 구조 | Validation objective (평균 ± seed 표준편차) | Validation score MSE | 학습 시간 평균 | Peak RAM |
+|---|---:|---:|---:|---:|
+| Global-only | `.950681 ± .005455` | `.331929`¹ | 16.3분 | 약 27.5 MiB |
+| Local/global + score | `.981414 ± .017254` | `.307390 ± .016221` | 22.1분 | 약 28.1 MiB |
+
+¹ 대조군의 score learning rate는 0이므로 score head는 학습되지 않았습니다. 이 값은 학습된 score head와의 성능 비교 기준이 아닙니다. 각 seed의 checkpoint는 [`checkpoints/go/experiments/local-global-score-20261101/`](./checkpoints/go/experiments/local-global-score-20261101/)에 저장했습니다.
+
+훈련에 사용하지 않은 KGS 2019년 4월, KGS 2018년 4월, Fox 프로 기보에서 측정한 착수 단위 지표입니다. 표의 값은 세 seed 평균 ± 표본 표준편차이며 policy top-1은 높을수록, MSE는 낮을수록 좋습니다.
+
+| 독립 데이터 | 판수 / 착수 | Global-only value MSE | Local/global value MSE | Global-only policy top-1 | Local/global policy top-1 | Global-only score MSE¹ | Local/global score MSE |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| KGS 2019-04 | 1,231 / 232,601 | `.971432 ± .004706` | `.987239 ± .007378` | `.012948 ± .001582` | `.012455 ± .000874` | `.441787` | `.415954 ± .006735` |
+| KGS 2018-04 | 1,582 / 304,466 | `.977404 ± .003550` | `.993820 ± .005611` | `.012636 ± .001346` | `.011804 ± .000577` | `.255653` | `.249046 ± .007019` |
+| Fox pro | 1,947 / 369,858 | `1.005518 ± .005724` | `1.000368 ± .002584` | `.010367 ± .001802` | `.010251 ± .001123` | `.017834` | `.035529 ± .010542` |
+
+¹ Global-only score head는 학습되지 않았습니다. 균등 합법수 policy top-1 기준은 데이터별로 `.004479`, `.004392`, `.004142`입니다. Local/global 실험군은 세 데이터 모두 policy top-1이 대조군보다 낮았고, value MSE는 KGS 두 데이터에서 더 나빴으며 Fox에서만 나았습니다. Score MSE는 KGS에서 낮아졌지만 Fox에서는 악화됐습니다. 따라서 여러 seed와 독립 데이터에서도 이번 구조·score 설정 조합이 일관된 성능 개선을 보였다고 할 수 없습니다. 구조와 score 학습을 동시에 바꾼 비교이므로 각 요소의 효과를 분리해 결론내릴 수도 없습니다.
+
+각 checkpoint로 KataGo v1.18.2와 20판씩, 총 120판을 대국했습니다. 모두 19×19, komi 7.5, Chinese rules, KataGo CPU b6c64 네트워크, KataGo 32 visits/수, NeuroGo 32 simulations/수, cpuct 1.4, 양쪽 모두 MCTS 후보 24, 검색 스레드 1개이며 각 모델이 흑·백을 10판씩 맡았습니다. global-only checkpoint의 후보 설정은 원래 12였지만 대국 명령에서 24로 override해 두 모델을 맞췄습니다. 모든 대국은 benchmark seed 4242, KataGo `searchRandSeed=neuro42`를 사용했습니다. 최종 승패는 KataGo `final_score`로 판정했습니다.
+
+| 구조 / 학습 seed | NeuroGo W-L-D | 흑 모델 W-L-D | 백 모델 W-L-D | 모델 관점 평균 점수 차 | 로컬 점수와 `final_score` 불일치 |
+|---|---:|---:|---:|---:|---:|
+| Global-only / 42 | 0-20-0 | 0-10-0 | 0-10-0 | `-32.3` | 18/20 |
+| Global-only / 43 | 0-20-0 | 0-10-0 | 0-10-0 | `-32.6` | 13/20 |
+| Global-only / 44 | 1-19-0 | 0-10-0 | 1-9-0 | `-30.4` | 19/20 |
+| Local/global + score / 42 | 0-20-0 | 0-10-0 | 0-10-0 | `-32.2` | 10/20 |
+| Local/global + score / 43 | 0-20-0 | 0-10-0 | 0-10-0 | `-32.4` | 19/20 |
+| Local/global + score / 44 | 0-20-0 | 0-10-0 | 0-10-0 | `-32.5` | 13/20 |
+
+Global-only는 60판 중 1승, local/global + score는 60판 모두 패했습니다. 색별로는 global-only가 흑 0/30승·백 1/30승, 실험군은 두 색 모두 0/30승입니다. 두 설정 모두 KataGo에 크게 뒤졌으며, 이 표본으로 작은 기력 차이나 Elo를 추정할 수 없습니다. `final_score` 불일치는 NeuroGo의 로컬 영역 점수와 KataGo 판정의 차이로, 최종 W-L 집계에는 외부 점수를 사용했습니다. visits와 simulations 수는 맞췄지만 엔진별 계산량은 같지 않으므로 통제된 Elo 비교가 아닙니다.
+
+대국 재현 예시:
+
+```bash
+cargo run --release -- go-benchmark-gtp-mcts \
+  checkpoints/go/experiments/local-global-score-20261101/global-seed42.gns \
+  /path/to/katago 20 4242 7.5 32 1.4 24 \
+  gtp -model /path/to/b6c64.txt.gz -config /path/to/default_gtp.cfg \
+  -override-config maxVisits=32,numSearchThreads=1,rules=chinese,ponderingEnabled=false,searchRandSeed=neuro42
+```
+
+이번 측정은 300게임 단일 seed smoke 비교보다 넓은 재검증이지만, seed당 20판·학습 3 epochs이므로 최종 기력 추정이나 우세 판정은 아닙니다. 특히 성능 병목은 단순히 뉴런 수가 부족하다는 증거가 아니라, 희소 모델이 KGS/Fox 분포에서 policy/value를 안정적으로 일반화하지 못하고 제한 MCTS로도 KataGo의 탐색·평가 품질 차이를 메우지 못한 데서 드러납니다. 다음 비교에서는 local 연결, score 보조 학습, 데이터량을 각각 분리한 ablation과 더 긴 validation 기반 학습을 먼저 수행해야 합니다.

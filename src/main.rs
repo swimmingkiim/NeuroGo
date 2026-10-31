@@ -27,12 +27,12 @@ fn usage() {
         "  go-generate <size> <games> <file> [seed=42]\n",
         "  go-import-sgf <sgf-file-or-directory> <data.csv> [skip_invalid=false]\n",
         "  go-export-sgf <data.csv> <sgf-file>\n",
-        "  go-train <data> <model.gns> [epochs=2] [seed=42] [validation_fraction=0.1] [split_seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [error_threshold=0.55] [novelty=0.2] [prune_strength=0.01] [growth_rule=0|1|2] [spatial_radius=0] [activation_balance=0.2] [value_learning_rate=0.00001]\n",
-        "  go-distill <teacher-train.tsv> <teacher-validation.tsv> <model.gns> [epochs=5] [seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [spatial_radius=0] [activation_balance=0.2]\n",
+        "  go-train <data> <model.gns> [epochs=2] [seed=42] [validation_fraction=0.1] [split_seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [error_threshold=0.55] [novelty=0.2] [prune_strength=0.01] [growth_rule=0|1|2] [spatial_radius=0] [activation_balance=0.2] [value_learning_rate=0.00001] [score_learning_rate=0.0001] [global_node_fraction=0.25] [mcts_candidates=24]\n",
+        "  go-distill <teacher-train.tsv> <teacher-validation.tsv> <model.gns> [epochs=5] [seed=42] [max_nodes=128] [top_k=8] [max_edges=16] [spatial_radius=0] [activation_balance=0.2] [global_node_fraction=0.25] [mcts_candidates=24] [score_learning_rate=0.0001]\n",
         "  go-evaluate <model> <data.csv>\n",
         "  go-benchmark <model> [games=20] [seed=42] [komi=6.5]\n",
         "  go-benchmark-mcts <model> <games> <seed> <komi> <simulations> [cpuct=1.4] [opponent=heuristic|random]\n",
-        "  go-benchmark-gtp-mcts <model> <engine> <games> <seed> <komi> <simulations> <cpuct> [engine-arg ...]\n",
+        "  go-benchmark-gtp-mcts <model> <engine> <games> <seed> <komi> <simulations> <cpuct> [mcts_candidates] [engine-arg ...]\n",
         "  go-benchmark-gtp <model> <engine> <games> <seed> <komi> [engine-arg ...]\n",
         "  eval <checkpoint> [opponent=random|heuristic|search] [games] [seed] [depth]\n",
         "  benchmark <checkpoint> [games] [seed]\n",
@@ -327,6 +327,12 @@ fn run() -> Result<(), String> {
                 parse_optional(&a, 16, "activation_balance")?.unwrap_or(config.activation_balance);
             config.value_learning_rate = parse_optional(&a, 17, "value_learning_rate")?
                 .unwrap_or(config.value_learning_rate);
+            config.score_learning_rate = parse_optional(&a, 18, "score_learning_rate")?
+                .unwrap_or(config.score_learning_rate);
+            config.global_node_fraction = parse_optional(&a, 19, "global_node_fraction")?
+                .unwrap_or(config.global_node_fraction);
+            config.mcts_candidates =
+                parse_optional(&a, 20, "mcts_candidates")?.unwrap_or(config.mcts_candidates);
             let games = neurofour::go::load_games(data)?;
             let size = games.first().ok_or("empty Go data")?.size;
             let (training_games, validation_games) =
@@ -367,7 +373,11 @@ fn run() -> Result<(), String> {
                 .map(|epoch| epoch.to_string())
                 .unwrap_or_else(|| "disabled".into());
             let (usage_nodes, used_nodes, mean_usage, max_usage) = model.neuron_usage_stats();
-            println!("trained_go architecture=dynamic_sparse size={size} nodes={} edges={} top_k={} max_nodes={} max_edges_per_node={} error_threshold={} novelty_threshold={} prune_strength={} growth_rule={} spatial_radius={} activation_balance={} value_learning_rate={} used_neurons={used_nodes}/{usage_nodes} mean_selection_rate={mean_usage:.6} max_selection_rate={max_usage:.6} training_symmetries=8 policy_objective=legal_softmax early_stopping=policy_value_objective train_games={} validation_games={} epochs={epochs} best_epoch={best_epoch} train_loss={loss:.6} validation_baseline_loss={validation_baseline} validation_loss={validation_loss} validation_moves={validation_moves} time_ms={} peak_ram_kb={} file={output}",model.nodes.len(),model.edge_count(),model.cfg.top_k,model.cfg.max_nodes,model.cfg.max_edges_per_node,model.cfg.error_threshold,model.cfg.novelty_threshold,model.cfg.prune_strength,model.cfg.growth_rule,model.cfg.spatial_radius,model.cfg.activation_balance,model.cfg.value_learning_rate,training_games.len(),validation_games.len(),t.elapsed().as_millis(),memory_kb());
+            let (score_mse, score_moves) = model.evaluate_score_loss(&validation_games)?;
+            let score_mse = score_mse
+                .map(|mse| format!("{mse:.6}"))
+                .unwrap_or_else(|| "unavailable".into());
+            println!("trained_go architecture=dynamic_sparse size={size} nodes={} edges={} global_nodes={} top_k={} max_nodes={} max_edges_per_node={} error_threshold={} novelty_threshold={} prune_strength={} growth_rule={} spatial_radius={} global_node_fraction={} mcts_candidates={} activation_balance={} value_learning_rate={} score_learning_rate={} used_neurons={used_nodes}/{usage_nodes} mean_selection_rate={mean_usage:.6} max_selection_rate={max_usage:.6} training_symmetries=8 policy_objective=legal_softmax auxiliary_score_moves={score_moves} validation_score_mse={score_mse} early_stopping=policy_value_score_objective train_games={} validation_games={} epochs={epochs} best_epoch={best_epoch} train_loss={loss:.6} validation_baseline_loss={validation_baseline} validation_loss={validation_loss} validation_moves={validation_moves} time_ms={} peak_ram_kb={} file={output}",model.nodes.len(),model.edge_count(),model.nodes.iter().filter(|node| node.global).count(),model.cfg.top_k,model.cfg.max_nodes,model.cfg.max_edges_per_node,model.cfg.error_threshold,model.cfg.novelty_threshold,model.cfg.prune_strength,model.cfg.growth_rule,model.cfg.spatial_radius,model.cfg.global_node_fraction,model.cfg.mcts_candidates,model.cfg.activation_balance,model.cfg.value_learning_rate,model.cfg.score_learning_rate,training_games.len(),validation_games.len(),t.elapsed().as_millis(),memory_kb());
         }
         Some("go-distill") => {
             let training_path = a.get(2).ok_or("missing teacher training dataset")?;
@@ -410,6 +420,12 @@ fn run() -> Result<(), String> {
                 parse_optional(&a, 10, "spatial_radius")?.unwrap_or(config.spatial_radius);
             config.activation_balance =
                 parse_optional(&a, 11, "activation_balance")?.unwrap_or(config.activation_balance);
+            config.global_node_fraction = parse_optional(&a, 12, "global_node_fraction")?
+                .unwrap_or(config.global_node_fraction);
+            config.mcts_candidates =
+                parse_optional(&a, 13, "mcts_candidates")?.unwrap_or(config.mcts_candidates);
+            config.score_learning_rate = parse_optional(&a, 14, "score_learning_rate")?
+                .unwrap_or(config.score_learning_rate);
             let mut model = neurofour::go::GoSparseModel::new(size, config, seed)?;
             let baseline = model.evaluate_teacher_metrics(&validation)?;
             let t = Instant::now();
@@ -434,9 +450,13 @@ fn run() -> Result<(), String> {
             let games = neurofour::go::load_games(a.get(3).ok_or("missing Go data")?)?;
             let matching_games = games.iter().filter(|game| game.size == model.size).count();
             let (value_mse, value_moves) = model.evaluate_loss(&games)?;
+            let (score_mse, score_moves) = model.evaluate_score_loss(&games)?;
             let (policy_top1, random_top1, policy_moves) = model.evaluate_policy_top1(&games)?;
             let (usage_nodes, used_nodes, mean_usage, max_usage) = model.neuron_usage_stats();
-            println!("evaluated_go architecture=dynamic_sparse size={} games={matching_games} nodes={} edges={} used_neurons={used_nodes}/{usage_nodes} mean_selection_rate={mean_usage:.6} max_selection_rate={max_usage:.6} activation_balance={} value_mse={value_mse:.6} value_moves={value_moves} policy_top1={policy_top1:.6} random_policy_top1={random_top1:.6} policy_moves={policy_moves}",model.size,model.nodes.len(),model.edge_count(),model.cfg.activation_balance);
+            let score_mse = score_mse
+                .map(|mse| format!("{mse:.6}"))
+                .unwrap_or_else(|| "unavailable".into());
+            println!("evaluated_go architecture=dynamic_sparse size={} games={matching_games} nodes={} edges={} global_nodes={} used_neurons={used_nodes}/{usage_nodes} mean_selection_rate={mean_usage:.6} max_selection_rate={max_usage:.6} activation_balance={} score_learning_rate={} value_mse={value_mse:.6} value_moves={value_moves} score_mse={score_mse} score_moves={score_moves} policy_top1={policy_top1:.6} random_policy_top1={random_top1:.6} policy_moves={policy_moves}",model.size,model.nodes.len(),model.edge_count(),model.nodes.iter().filter(|node| node.global).count(),model.cfg.activation_balance,model.cfg.score_learning_rate);
         }
         Some("go-benchmark") => {
             let model = neurofour::go::GoSparseModel::load(a.get(2).ok_or("missing Go model")?)?;
@@ -513,10 +533,17 @@ fn run() -> Result<(), String> {
                 .map_err(|_| "invalid GTP benchmark komi")?;
             let t = Instant::now();
             let results = neurofour::go::benchmark_gtp(&model, engine, &a[7..], games, seed, komi)?;
-            println!("go_gtp_benchmark architecture=dynamic_sparse board_size={} nodes={} edges={} engine={engine} games={games} W-L-D={}-{}-{} score={:.3} model_black={}-{}-{} model_white={}-{}-{} final_score_disagreements={} time_ms={} peak_ram_kb={}",model.size,model.nodes.len(),model.edge_count(),results.wins,results.losses,results.draws,(results.wins as f64 + results.draws as f64 * 0.5) / games as f64,results.model_black.0,results.model_black.1,results.model_black.2,results.model_white.0,results.model_white.1,results.model_white.2,results.score_disagreements,t.elapsed().as_millis(),memory_kb());
+            let (mean_margin, black_margin, white_margin) = results.score_margin_means();
+            let margin_text = |margin: Option<f64>| {
+                margin
+                    .map(|margin| format!("{margin:.1}"))
+                    .unwrap_or_else(|| "unavailable".into())
+            };
+            println!("go_gtp_benchmark architecture=dynamic_sparse board_size={} nodes={} edges={} engine={engine} games={games} W-L-D={}-{}-{} score={:.3} model_black={}-{}-{} model_white={}-{}-{} score_margin_mean={} score_margin_games={} black_score_margin_mean={} white_score_margin_mean={} final_score_disagreements={} time_ms={} peak_ram_kb={}",model.size,model.nodes.len(),model.edge_count(),results.wins,results.losses,results.draws,(results.wins as f64 + results.draws as f64 * 0.5) / games as f64,results.model_black.0,results.model_black.1,results.model_black.2,results.model_white.0,results.model_white.1,results.model_white.2,margin_text(mean_margin),results.score_margin_games,margin_text(black_margin),margin_text(white_margin),results.score_disagreements,t.elapsed().as_millis(),memory_kb());
         }
         Some("go-benchmark-gtp-mcts") => {
-            let model = neurofour::go::GoSparseModel::load(a.get(2).ok_or("missing Go model")?)?;
+            let mut model =
+                neurofour::go::GoSparseModel::load(a.get(2).ok_or("missing Go model")?)?;
             let engine = a.get(3).ok_or("missing GTP engine")?;
             let games = a
                 .get(4)
@@ -543,18 +570,34 @@ fn run() -> Result<(), String> {
                 .ok_or("missing MCTS cpuct")?
                 .parse::<f32>()
                 .map_err(|_| "invalid MCTS cpuct")?;
+            let engine_arg_start =
+                if let Some(value) = a.get(9).and_then(|value| value.parse::<usize>().ok()) {
+                    if value == 0 || value > model.size * model.size + 1 {
+                        return Err("invalid MCTS candidate count".into());
+                    }
+                    model.cfg.mcts_candidates = value;
+                    10
+                } else {
+                    9
+                };
             let t = Instant::now();
             let results = neurofour::go::benchmark_gtp_mcts(
                 &model,
                 engine,
-                &a[9..],
+                &a[engine_arg_start..],
                 games,
                 seed,
                 komi,
                 simulations,
                 cpuct,
             )?;
-            println!("go_gtp_mcts_benchmark architecture=dynamic_sparse board_size={} nodes={} edges={} engine={engine} simulations={simulations} cpuct={cpuct} games={games} W-L-D={}-{}-{} score={:.3} model_black={}-{}-{} model_white={}-{}-{} final_score_disagreements={} time_ms={} peak_ram_kb={}",model.size,model.nodes.len(),model.edge_count(),results.wins,results.losses,results.draws,(results.wins as f64 + results.draws as f64 * 0.5) / games as f64,results.model_black.0,results.model_black.1,results.model_black.2,results.model_white.0,results.model_white.1,results.model_white.2,results.score_disagreements,t.elapsed().as_millis(),memory_kb());
+            let (mean_margin, black_margin, white_margin) = results.score_margin_means();
+            let margin_text = |margin: Option<f64>| {
+                margin
+                    .map(|margin| format!("{margin:.1}"))
+                    .unwrap_or_else(|| "unavailable".into())
+            };
+            println!("go_gtp_mcts_benchmark architecture=dynamic_sparse board_size={} nodes={} edges={} engine={engine} simulations={simulations} mcts_candidates={} cpuct={cpuct} games={games} W-L-D={}-{}-{} score={:.3} model_black={}-{}-{} model_white={}-{}-{} score_margin_mean={} score_margin_games={} black_score_margin_mean={} white_score_margin_mean={} final_score_disagreements={} time_ms={} peak_ram_kb={}",model.size,model.nodes.len(),model.edge_count(),model.cfg.mcts_candidates,results.wins,results.losses,results.draws,(results.wins as f64 + results.draws as f64 * 0.5) / games as f64,results.model_black.0,results.model_black.1,results.model_black.2,results.model_white.0,results.model_white.1,results.model_white.2,margin_text(mean_margin),results.score_margin_games,margin_text(black_margin),margin_text(white_margin),results.score_disagreements,t.elapsed().as_millis(),memory_kb());
         }
         Some("eval") => {
             let cp = a.get(2).ok_or("missing checkpoint")?;
